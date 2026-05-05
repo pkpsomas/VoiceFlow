@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import time
-import threading
-from contextlib import contextmanager
-from typing import Optional, Any, Dict
+import ctypes
 import logging
 import re
-import ctypes
+import threading
+import time
+from contextlib import contextmanager
+from typing import Any, Dict, Optional
+
 try:
     from ctypes import wintypes
 except Exception:  # pragma: no cover
@@ -16,6 +17,22 @@ except Exception:  # pragma: no cover
     wintypes = _WinTypesFallback()
 
 # Graceful imports for testing environments without system packages
+try:
+    import win32clipboard as _win32clipboard  # type: ignore
+    _HAS_WIN32CLIPBOARD = True
+except Exception:
+    _win32clipboard = None  # type: ignore
+    _HAS_WIN32CLIPBOARD = False
+
+# Handle-based clipboard formats that cannot be serialized or re-set via SetClipboardData.
+# GetClipboardData returns a GDI/kernel handle for these — meaningless after restore.
+_SKIP_CLIPBOARD_FORMATS: frozenset = frozenset([
+    2,   # CF_BITMAP
+    3,   # CF_METAFILEPICT
+    9,   # CF_PALETTE
+    14,  # CF_ENHMETAFILE
+])
+
 try:
     import pyperclip  # type: ignore
 except Exception:  # pragma: no cover - fallback for minimal environments
@@ -45,7 +62,7 @@ except Exception:  # pragma: no cover - fallback for minimal environments
     keyboard = _KeyboardFallback()  # type: ignore
 
 from voiceflow.core.config import Config
-from voiceflow.utils.validation import validate_text_input, ValidationError
+from voiceflow.utils.validation import ValidationError, validate_text_input
 
 try:
     import psutil  # type: ignore
@@ -64,6 +81,82 @@ class _RECT(ctypes.Structure):
     ]
 
 
+def _snapshot_clipboard_all_formats() -> Optional[dict]:
+    """Capture all serializable clipboard formats via win32clipboard.
+
+    Returns a {format_id: data} dict, or None if win32clipboard is unavailable or the
+    clipboard is empty/inaccessible.  Handle-based formats in _SKIP_CLIPBOARD_FORMATS
+    are silently skipped — they cannot be round-tripped through SetClipboardData.
+    """
+    if not _HAS_WIN32CLIPBOARD or _win32clipboard is None:
+        return None
+    snapshot: dict = {}
+    try:
+        _win32clipboard.OpenClipboard(None)
+        try:
+            fmt = _win32clipboard.EnumClipboardFormats(0)
+            while fmt:
+                if fmt not in _SKIP_CLIPBOARD_FORMATS:
+                    try:
+                        snapshot[fmt] = _win32clipboard.GetClipboardData(fmt)
+                    except Exception:
+                        pass
+                fmt = _win32clipboard.EnumClipboardFormats(fmt)
+        finally:
+            _win32clipboard.CloseClipboard()
+    except Exception:
+        return None
+    return snapshot if snapshot else None
+
+
+def _restore_clipboard_all_formats(snapshot: dict) -> None:
+    """Restore clipboard contents from a snapshot produced by _snapshot_clipboard_all_formats.
+
+    Opens the clipboard, empties it, then calls SetClipboardData for each saved format.
+    Formats that fail SetClipboardData (e.g. stale handle-based data) are skipped silently.
+    """
+    if not _HAS_WIN32CLIPBOARD or _win32clipboard is None or not snapshot:
+        return
+    _win32clipboard.OpenClipboard(None)
+    try:
+        _win32clipboard.EmptyClipboard()
+        for fmt, data in snapshot.items():
+            try:
+                _win32clipboard.SetClipboardData(fmt, data)
+            except Exception:
+                pass
+    finally:
+        _win32clipboard.CloseClipboard()
+
+
+def _schedule_clipboard_restore_all(
+    snapshot: dict,
+    *,
+    retry_window_seconds: float,
+    log: Optional[logging.Logger] = None,
+) -> None:
+    """Best-effort background restore for a multi-format clipboard snapshot."""
+    window = max(0.5, float(retry_window_seconds))
+
+    def _worker() -> None:
+        deadline = time.time() + window
+        last_error: Optional[Exception] = None
+        while time.time() < deadline:
+            try:
+                _restore_clipboard_all_formats(snapshot)
+                if log:
+                    log.info("clipboard_restore_async_all_success window_s=%.2f", window)
+                return
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.35)
+        if log:
+            log.warning("clipboard_restore_async_all_failed window_s=%.2f error=%s", window, last_error)
+
+    thread = threading.Thread(target=_worker, name="ClipboardRestoreAll", daemon=True)
+    thread.start()
+
+
 def _schedule_clipboard_restore(
     text: str,
     *,
@@ -72,8 +165,7 @@ def _schedule_clipboard_restore(
     base_delay: float,
     log: Optional[logging.Logger] = None,
 ) -> None:
-    """
-    Best-effort background clipboard restore when immediate restore fails.
+    """Best-effort background clipboard restore when immediate restore fails.
     This reduces risk of losing user clipboard contents under transient lock contention.
     """
     window = max(0.5, float(retry_window_seconds))
@@ -108,34 +200,50 @@ def _preserve_clipboard(
     restore_async_retry_seconds: float = 8.0,
     log: Optional[logging.Logger] = None,
 ):
+    snapshot: Optional[dict] = None
     prev: Optional[str] = None
     if enabled:
-        try:
-            prev = _clipboard_paste_with_retry()
-        except Exception as exc:
-            if log:
-                log.warning("clipboard_snapshot_failed error=%s", exc)
-            prev = None
+        # Prefer multi-format snapshot (preserves images, files, etc.)
+        snapshot = _snapshot_clipboard_all_formats()
+        if snapshot is None:
+            # Fallback: text-only via pyperclip for environments without win32clipboard
+            try:
+                prev = _clipboard_paste_with_retry()
+            except Exception as exc:
+                if log:
+                    log.warning("clipboard_snapshot_failed error=%s", exc)
     try:
         yield
     finally:
-        if enabled and prev is not None:
-            try:
-                _clipboard_copy_with_retry(
-                    prev,
-                    attempts=max(1, int(restore_attempts)),
-                    base_delay=max(0.005, float(restore_base_delay)),
-                )
-            except Exception as exc:
-                if log:
-                    log.warning("clipboard_restore_immediate_failed error=%s", exc)
-                _schedule_clipboard_restore(
-                    prev,
-                    retry_window_seconds=float(restore_async_retry_seconds),
-                    attempts_per_try=max(2, int(restore_attempts)),
-                    base_delay=max(0.005, float(restore_base_delay)),
-                    log=log,
-                )
+        if enabled:
+            if snapshot is not None:
+                try:
+                    _restore_clipboard_all_formats(snapshot)
+                except Exception as exc:
+                    if log:
+                        log.warning("clipboard_restore_immediate_failed error=%s", exc)
+                    _schedule_clipboard_restore_all(
+                        snapshot,
+                        retry_window_seconds=float(restore_async_retry_seconds),
+                        log=log,
+                    )
+            elif prev is not None:
+                try:
+                    _clipboard_copy_with_retry(
+                        prev,
+                        attempts=max(1, int(restore_attempts)),
+                        base_delay=max(0.005, float(restore_base_delay)),
+                    )
+                except Exception as exc:
+                    if log:
+                        log.warning("clipboard_restore_immediate_failed error=%s", exc)
+                    _schedule_clipboard_restore(
+                        prev,
+                        retry_window_seconds=float(restore_async_retry_seconds),
+                        attempts_per_try=max(2, int(restore_attempts)),
+                        base_delay=max(0.005, float(restore_base_delay)),
+                        log=log,
+                    )
 
 
 def _clipboard_copy_with_retry(text: str, attempts: int = 6, base_delay: float = 0.03) -> None:
@@ -307,8 +415,7 @@ class ClipboardInjector:
         self._target_context = {}
 
     def get_target_context(self, refresh: bool = False) -> Dict[str, Any]:
-        """
-        Return cached target window context captured at recording start.
+        """Return cached target window context captured at recording start.
         Falls back to current foreground window when target is unavailable.
         """
         hwnd = self._target_hwnd
@@ -340,8 +447,7 @@ class ClipboardInjector:
         return int(fg) == int(self._target_hwnd)
 
     def _ensure_target_focus_for_release(self) -> bool:
-        """
-        Guardrail for release-time injection.
+        """Guardrail for release-time injection.
         If focus drifted away from the captured target window, attempt bounded re-focus.
         """
         require_focus = bool(getattr(self.cfg, "inject_require_target_focus", True))
@@ -426,8 +532,7 @@ class ClipboardInjector:
         return context
 
     def inject_live_checkpoint(self, text: str) -> bool:
-        """
-        Inject while PTT keys may still be held.
+        """Inject while PTT keys may still be held.
         Keep this path low-risk for continuous hold:
         do not force focus changes mid-recording, only inject into the captured target
         when it is already foreground.

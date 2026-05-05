@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import types
 import time
 
 from voiceflow.core.config import Config
@@ -138,6 +137,8 @@ def test_clipboard_restore_async_retry_recovers_previous_value(monkeypatch):
     def fake_send(seq: str):
         sent.append(seq)
 
+    # Force text-only fallback; this test exercises the pyperclip async retry, not win32clipboard.
+    monkeypatch.setattr("voiceflow.integrations.inject._HAS_WIN32CLIPBOARD", False)
     monkeypatch.setattr("voiceflow.integrations.inject.pyperclip.copy", flaky_copy)
     monkeypatch.setattr("voiceflow.integrations.inject.pyperclip.paste", fake_paste)
     monkeypatch.setattr("voiceflow.integrations.inject.keyboard.send", fake_send)
