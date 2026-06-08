@@ -191,6 +191,10 @@ class ModelPreloader:
 
     def _run_warmup(self) -> None:
         """Run warmup transcription with realistic audio"""
+        # Cloud backends (e.g. Soniox) have no local model to warm up.
+        if getattr(self.asr, "skip_warmup", False):
+            logger.info("Warmup skipped (cloud backend)")
+            return
         # Generate warmup audio: short burst of speech-like frequencies
         # This is more realistic than silence and ensures all code paths are exercised
         sample_rate = getattr(self.asr, 'sample_rate', 16000)

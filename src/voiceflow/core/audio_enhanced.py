@@ -425,17 +425,24 @@ class EnhancedAudioRecorder:
         self._lock = threading.Lock()
         self._recording = False
         self._start_time = 0.0
-        
+
         # Performance monitoring
         self._callback_count = 0
         self._total_frames = 0
-        
+
+        # Use the system default input device/host API. (Explicit WASAPI device
+        # selection proved unstable on this machine — WDM-KS/USB enumeration
+        # errors.) None lets sounddevice pick the default.
+        self._input_device = None
+        self._input_extra_settings = None
+
         print(f"[AudioRecorder] Enhanced recorder initialized:")
         print(f"  - Sample rate: {cfg.sample_rate}Hz")
         print(f"  - Channels: {cfg.channels}")
         print(f"  - Block size: {cfg.blocksize} frames")
         print(f"  - Max duration: {max_duration}s")
         print(f"  - Pre-buffer: {self._pre_buffer_duration}s")
+        print(f"  - Input device: {self._input_device}")
 
     def _callback(self, indata, frames, time, status):
         """Enhanced audio callback with bounded buffer and validation"""
@@ -450,21 +457,12 @@ class EnhancedAudioRecorder:
             self._callback_count += 1
             self._total_frames += frames
 
-            # CRITICAL: Validate input data first
-            data = audio_validation_guard(indata.copy(), "AudioCallback", allow_empty=True)
-
-            # Skip if empty after validation
-            if data.size == 0:
-                return
-
-            # Convert to mono if needed (already handled by validation guard)
-            # Add to bounded buffer (thread-safe)
-            self._ring_buffer.append(data)
-
-            # Reduced logging: only log every 200 callbacks (~12.8 seconds)
-            if self._callback_count % 200 == 0:
-                duration = self._ring_buffer.get_duration_seconds()
-                print(f"[AudioRecorder] Recording: {duration:.1f}s")
+            # REAL-TIME CALLBACK: do the absolute minimum here. Heavy work (NaN/Inf
+            # validation, normalization) must NOT run in the PortAudio callback
+            # thread — it stalls the GIL-bound callback and causes input overflow
+            # (dropped/spliced audio). Validation happens downstream at stop()/
+            # transcription time instead.
+            self._ring_buffer.append(indata.copy())
 
         except Exception as e:
             logger.error(f"[AudioRecorder] Critical error in audio callback: {e}")
@@ -503,37 +501,29 @@ class EnhancedAudioRecorder:
         # CRITICAL FIX: Clear main buffer before starting to prevent old data corruption
         self._ring_buffer.clear()
         
-        # Start continuous recording if not already running
-        if not self._continuous_recording:
-            self.start_continuous()
-        
-        # Get pre-buffer data BEFORE clearing to use for this recording
-        pre_buffer_data = self._pre_buffer.get_data()
-        
-        # CRITICAL FIX: Clear pre-buffer IMMEDIATELY after getting data
-        # This prevents any accumulation while we process
+        # NOTE: The continuous pre-buffer stream is intentionally NOT used. It
+        # overflowed under CPU load and its gappy audio, when prepended, mangled
+        # the first word(s) of the transcript. We rely solely on the clean main
+        # recording stream below. Ensure the continuous stream is stopped so only
+        # ONE InputStream captures the mic (concurrent streams cause overflow).
+        self.stop_continuous()
         self._pre_buffer.clear()
-        
-        if len(pre_buffer_data) > 0:
-            # Take only the most recent portion to minimize latency
-            min_pre_buffer_samples = int(0.3 * self.cfg.sample_rate)  # 300ms minimum
-            if len(pre_buffer_data) > min_pre_buffer_samples:
-                # Use recent 800ms of pre-buffer for optimal key-press timing
-                recent_samples = int(0.8 * self.cfg.sample_rate)
-                pre_buffer_data = pre_buffer_data[-recent_samples:]
-            
-            # Add pre-buffer to main buffer for this recording only
-            self._ring_buffer.append(pre_buffer_data)
-        
+
         self._callback_count = 0
         self._total_frames = 0
         self._start_time = time.time()
-        
+
         self._stream = sd.InputStream(
+            device=self._input_device,
             channels=self.cfg.channels,
             samplerate=self.cfg.sample_rate,
             dtype="float32",
-            blocksize=self.cfg.blocksize,
+            # Larger block + buffer to tolerate GIL stalls from VoiceFlow's many
+            # background threads. Small blocks (512) + low latency starved the
+            # callback and caused input overflow (dropped/spliced speech).
+            blocksize=1600,   # 100 ms per callback (~10 callbacks/s, fewer GIL grabs)
+            latency=0.5,      # ~500 ms PortAudio ring buffer absorbs callback stalls
+            extra_settings=self._input_extra_settings,
             callback=self._callback,
         )
         self._stream.start()
@@ -563,7 +553,7 @@ class EnhancedAudioRecorder:
             # CRITICAL FIX: Clear buffer after getting data to prevent accumulation
             self._ring_buffer.clear()
             print(f"[AudioRecorder] Buffer cleared after extraction to prevent accumulation")
-            
+
             # Performance summary
             actual_duration = time.time() - self._start_time
             print(f"[AudioRecorder] Recording stopped:")
@@ -600,6 +590,7 @@ class EnhancedAudioRecorder:
             samplerate=self.cfg.sample_rate,
             dtype="float32",
             blocksize=self.cfg.blocksize,
+            latency="high",  # larger PortAudio buffer to prevent input overflow / dropped audio
             callback=self._continuous_callback,
         )
         self._continuous_stream.start()

@@ -275,6 +275,17 @@ class Config:
     daily_learning_max_history_items: int = 400  # Bound startup catch-up workload
     daily_learning_max_correction_items: int = 400  # Bound startup catch-up workload
 
+    # Soniox cloud STT backend
+    # Set transcriber="soniox" to use Soniox instead of a local Whisper model.
+    transcriber: str = "whisper"  # "whisper" | "soniox"
+    soniox_api_key: str = ""  # required when transcriber="soniox"; also read from SONIOX_API_KEY env-var
+    soniox_model: str = "stt-rt-v4"
+    soniox_endpoint: str = "wss://stt-rt.soniox.com/transcribe-websocket"
+    soniox_languages: list = None  # type: ignore[assignment]  # resolved to ["el", "en"] in __post_init__
+    soniox_enable_endpoint_detection: bool = True
+    soniox_context: str = ""  # optional domain-specific vocabulary hint
+    soniox_finalize_drain_ms: int = 250  # wait after finalize before closing socket
+
     # Misc
     language: str | None = "en"
     verbose: bool = True
@@ -288,6 +299,16 @@ class Config:
         This prevents crashes from invalid configuration values identified
         in comprehensive testing (10/40 edge case failures).
         """
+        import os as _os
+
+        # Resolve Soniox API key from environment when not set in config file
+        if not self.soniox_api_key:
+            self.soniox_api_key = _os.environ.get("SONIOX_API_KEY", "")
+
+        # Resolve mutable default for soniox_languages
+        if self.soniox_languages is None:
+            self.soniox_languages = ["el", "en"]
+
         from ..utils.guardrails import validate_config
 
         try:

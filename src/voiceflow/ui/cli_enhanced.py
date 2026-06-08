@@ -49,6 +49,7 @@ else:
     from voiceflow.core.asr_engine import (
         ModernWhisperASR as WhisperASR,  # type: ignore[assignment]
     )
+from voiceflow.core.soniox_backend import SonioxASRBackend
 # Cold start elimination
 import keyboard
 
@@ -543,17 +544,23 @@ class EnhancedApp:
 
         # Cold start elimination: Create ASR and start background preloading
         print("[STARTUP] Creating ASR engine...")
-        self.asr = WhisperASR(cfg)
+        _transcriber = str(getattr(cfg, "transcriber", "whisper")).strip().lower()
+        if _transcriber == "soniox":
+            print("[STARTUP] Using Soniox cloud STT backend")
+            self.asr = SonioxASRBackend(cfg)  # type: ignore[assignment]
+        else:
+            self.asr = WhisperASR(cfg)
         self._preloader = ModelPreloader(self.asr, on_progress=self._on_preload_progress)
         self._model_ready = False
         self.asr_fast: Optional[WhisperASR] = None
         self._fast_preloader: Optional[ModelPreloader] = None
         self._fast_model_ready = False
 
-        # Start background preloading immediately
+        # Start background preloading immediately (no-op for Soniox)
         print("[STARTUP] Starting background model preload...")
         self._preloader.start_preload()
-        self._init_fast_asr_path()
+        if _transcriber != "soniox":
+            self._init_fast_asr_path()
 
         # Enhanced thread management
         self.transcription_manager = EnhancedTranscriptionManager(
@@ -2095,11 +2102,29 @@ class EnhancedApp:
 
             print(f"[MIC] Captured {audio_duration:.2f}s of audio ({len(audio)} samples)")
 
-            # Audio preprocessing pipeline: high-pass filter, RMS normalization, noise gate
-            try:
-                audio = self._audio_preprocessor.process(audio)
-            except Exception as preprocess_error:
-                self._log.warning("audio_preprocessing_failed error=%s", preprocess_error)
+            # Audio preprocessing pipeline.
+            # For cloud STT (Soniox): the Whisper-oriented RMS-normalize hard-clips
+            # peaks to 1.0 and distorts the signal. This mic is quiet (peak ~0.2),
+            # so instead apply a clean PEAK normalization — boost gain so the loudest
+            # sample reaches ~0.95 with NO clipping. Gives Soniox a healthy level
+            # (like the browser playground's AGC) without distortion.
+            _transcriber = str(getattr(self.cfg, "transcriber", "whisper")).strip().lower()
+            if _transcriber == "soniox":
+                try:
+                    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+                    if peak > 1e-4:
+                        gain = min(0.95 / peak, 8.0)  # cap boost to avoid amplifying pure noise
+                        if gain > 1.0:
+                            audio = (audio * gain).astype(np.float32)
+                        self._log.info("soniox_peak_normalize peak_in=%.3f gain=%.2f peak_out=%.3f",
+                                       peak, gain, float(np.max(np.abs(audio))))
+                except Exception as norm_error:
+                    self._log.warning("soniox_peak_normalize_failed error=%s", norm_error)
+            else:
+                try:
+                    audio = self._audio_preprocessor.process(audio)
+                except Exception as preprocess_error:
+                    self._log.warning("audio_preprocessing_failed error=%s", preprocess_error)
 
             # CRITICAL FIX: Mark as processing ONLY after validation passes
             # This prevents stuck state when early validation fails
@@ -2977,6 +3002,18 @@ def main(argv=None):
     _start_single_instance_watchdog(interval_seconds=2.0)
 
     cfg = load_config(Config())
+
+    # Allow VOICEFLOW_TRANSCRIBER env-var to override config file setting
+    _env_transcriber = os.environ.get("VOICEFLOW_TRANSCRIBER", "").strip().lower()
+    if _env_transcriber:
+        cfg.transcriber = _env_transcriber
+
+    # Allow SONIOX_API_KEY env-var to override config file setting (already done in
+    # Config.__post_init__, but re-apply in case load_config overwrote it from JSON)
+    _env_soniox_key = os.environ.get("SONIOX_API_KEY", "").strip()
+    if _env_soniox_key:
+        cfg.soniox_api_key = _env_soniox_key
+
     setup_saved, _setup_restart_required = maybe_run_startup_setup(cfg)
     if setup_saved:
         print("[SETUP] Saved startup defaults from setup wizard.")
