@@ -407,25 +407,10 @@ class EnhancedTrayController(ITrayManager):
         )
 
         # Audio input source selection (mic / system loopback / both).
-        # Click-to-cycle top-level item: submenus fail to open on some
-        # Windows tray setups, so avoid them for this control.
-        _AUDIO_SOURCE_ORDER = ["mic", "system", "both"]
-        _AUDIO_SOURCE_LABELS = {
-            "mic": "Microphone",
-            "system": "System Audio",
-            "both": "Mic + System",
-        }
-
-        def _current_audio_source() -> str:
-            source = str(getattr(self.app.cfg, "audio_input_source", "mic")).strip().lower()
-            return source if source in _AUDIO_SOURCE_ORDER else "mic"
-
-        def cycle_audio_source(icon, item):  # noqa: ARG001
-            current = _current_audio_source()
-            new_source = _AUDIO_SOURCE_ORDER[
-                (_AUDIO_SOURCE_ORDER.index(current) + 1) % len(_AUDIO_SOURCE_ORDER)
-            ]
-            self.app.cfg.audio_input_source = new_source
+        # Mirrors the PTT Hotkey submenu pattern exactly (checked lambdas, no
+        # radio flag), which is known to render and click correctly.
+        def set_audio_source(source: str, label: str):
+            self.app.cfg.audio_input_source = source
             try:
                 from voiceflow.utils.settings import save_config
                 save_config(self.app.cfg)
@@ -434,10 +419,31 @@ class EnhancedTrayController(ITrayManager):
             rec = getattr(self.app, "rec", None)
             if rec is not None and hasattr(rec, "set_audio_source"):
                 try:
-                    rec.set_audio_source(new_source)
+                    rec.set_audio_source(source)
                 except Exception as e:
                     print(f"[Tray] Failed to apply audio source: {e}")
-            self._notify("VoiceFlow", f"Audio source: {_AUDIO_SOURCE_LABELS[new_source]}")
+            self._notify("VoiceFlow", f"Audio source: {label}")
+
+        def is_audio_source(source: str) -> bool:
+            return str(getattr(self.app.cfg, "audio_input_source", "mic")).strip().lower() == source
+
+        audio_source_menu = pystray.Menu(
+            pystray.MenuItem(
+                lambda item: "Microphone",
+                lambda icon, item: set_audio_source("mic", "Microphone"),
+                checked=lambda item: is_audio_source("mic"),
+            ),
+            pystray.MenuItem(
+                lambda item: "System Audio",
+                lambda icon, item: set_audio_source("system", "System Audio"),
+                checked=lambda item: is_audio_source("system"),
+            ),
+            pystray.MenuItem(
+                lambda item: "Mic + System Audio",
+                lambda icon, item: set_audio_source("both", "Mic + System Audio"),
+                checked=lambda item: is_audio_source("both"),
+            ),
+        )
 
         return pystray.Menu(
             pystray.MenuItem(
@@ -445,10 +451,7 @@ class EnhancedTrayController(ITrayManager):
                 toggle_code_mode,
                 checked=lambda item: self.app.code_mode,
             ),
-            pystray.MenuItem(
-                lambda item: f"Audio Source: {_AUDIO_SOURCE_LABELS[_current_audio_source()]}",
-                cycle_audio_source,
-            ),
+            pystray.MenuItem("Audio Source", audio_source_menu),
             pystray.MenuItem(
                 lambda item: f"Injection: {'Paste' if self.app.cfg.paste_injection else 'Type'}",
                 toggle_paste,

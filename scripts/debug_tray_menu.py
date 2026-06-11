@@ -104,7 +104,33 @@ def main() -> int:
         print("FAIL: 'Audio Source' item not in menu")
         return 1
 
+    # Open the submenu and click the entry for the currently saved source so
+    # the click path is exercised without changing the user's setting.
     target.click_input()
+    time.sleep(1.2)
+
+    label_by_source = {
+        "mic": "Microphone",
+        "system": "System Audio",
+        "both": "Mic + System Audio",
+    }
+    wanted = label_by_source.get(read_source(), "Microphone")
+
+    submenu_item = None
+    for w in desktop.windows():
+        if (w.element_info.class_name or "") != "#32768":
+            continue
+        for it in w.descendants(control_type="MenuItem"):
+            name = (it.window_text() or "").strip()
+            if name == wanted:
+                submenu_item = it
+    if submenu_item is None:
+        print(f"FAIL: submenu item {wanted!r} not found after expanding Audio Source")
+        ImageGrab.grab().save(SHOT)
+        return 1
+
+    print(f"clicking submenu item: {wanted!r}")
+    submenu_item.click_input()
     time.sleep(1.5)
     print(f"config source AFTER: {read_source()}")
     return 0
