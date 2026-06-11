@@ -2861,11 +2861,13 @@ class EnhancedApp:
             # Return to idle state after completion (for non-UI state)
             mark_idle()
 
-            # Update visual indicators - only if empty result (no auto-reset needed)
+            # Empty result: tell the user instead of silently going idle, so a
+            # silent source (e.g. system audio with nothing playing) is obvious.
+            # "complete" status auto-resets to idle after 2s via the tray timer.
             if not text.strip() and self.visual_indicators_enabled:
-                update_tray_status(self.tray_controller, "idle", False)
+                update_tray_status(self.tray_controller, "complete", False, "No speech detected")
                 if VISUAL_INDICATORS_AVAILABLE:
-                    hide_status()
+                    show_complete("No speech detected")
 
             self._last_transcription_completed_at = time.time()
             return text

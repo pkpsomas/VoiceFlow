@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +20,7 @@ class Config:
     sample_rate: int = 16000
     channels: int = 1
     blocksize: int = 512  # frames per callback, ~64 ms at 16k
+    audio_input_source: str = "mic"  # "mic" | "system" (WASAPI loopback) | "both" (mixed)
 
     # Performance optimizations
     enable_batching: bool = True  # Enable VAD-based batching for 12.5x speedup
@@ -276,7 +277,11 @@ class Config:
     daily_learning_max_correction_items: int = 400  # Bound startup catch-up workload
 
     # Misc
-    language: str | None = "en"
+    language: str | None = "en"  # legacy single-language hint; superseded by `languages`
+    # Languages to transcribe (ISO codes). One entry pins that language; multiple
+    # entries auto-detect among them per utterance. Non-English entries require
+    # multilingual models (tier routing handles this automatically).
+    languages: list = field(default_factory=lambda: ["en"])
     verbose: bool = True
     code_mode_default: bool = True
     code_mode_lowercase: bool = True

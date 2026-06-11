@@ -237,6 +237,8 @@ class ModelConfig:
     description: str = ""
     size_mb: int = 0
     languages: List[str] = field(default_factory=lambda: ["en"])
+    # Languages the user wants decoded (decode preference, not model capability).
+    task_languages: List[str] = field(default_factory=lambda: ["en"])
     supports_diarization: bool = False
     supports_word_timestamps: bool = True
     vad_filter: bool = True
@@ -294,6 +296,22 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         size_mb=500,
         languages=["en"],
     ),
+    "small": ModelConfig(
+        name="Small Multilingual",
+        model_id="small",
+        backend="faster-whisper",
+        description="Good balance, all Whisper languages",
+        size_mb=500,
+        languages=["multilingual"],
+    ),
+    "large-v3-turbo": ModelConfig(
+        name="Large v3 Turbo",
+        model_id="large-v3-turbo",
+        backend="faster-whisper",
+        description="Multilingual, near large-v3 accuracy at distil-like speed",
+        size_mb=1600,
+        languages=["multilingual"],
+    ),
     "medium.en": ModelConfig(
         name="Medium English",
         model_id="medium.en",
@@ -350,21 +368,62 @@ FASTER_WHISPER_MODEL_ALIASES: Dict[str, str] = {
 }
 
 
-def resolve_tier_model_key(tier: ModelTier, device: str = "cpu") -> str:
-    """Resolve model key for a tier using hardware-aware routing.
+# User-facing language spellings → Whisper ISO codes.
+LANGUAGE_ALIASES: Dict[str, str] = {
+    "gr": "el",
+    "greek": "el",
+    "ελληνικά": "el",
+    "english": "en",
+}
+
+
+def normalize_language_codes(languages) -> List[str]:
+    """Normalize a language list to unique Whisper ISO codes (default ['en'])."""
+    normalized: List[str] = []
+    for lang in languages or []:
+        code = str(lang).strip().lower()
+        code = LANGUAGE_ALIASES.get(code, code)
+        if code and code not in normalized:
+            normalized.append(code)
+    return normalized or ["en"]
+
+
+def languages_need_multilingual(languages: List[str]) -> bool:
+    return any(lang != "en" for lang in languages)
+
+
+# English-only model keys → closest multilingual equivalent.
+MULTILINGUAL_MODEL_FALLBACKS: Dict[str, str] = {
+    "tiny.en": "tiny",
+    "small.en": "small",
+    "medium.en": "large-v3-turbo",
+    "distil-large-v3": "large-v3-turbo",
+    "distil-large-v3.5": "large-v3-turbo",
+}
+
+
+def resolve_tier_model_key(tier: ModelTier, device: str = "cpu", multilingual: bool = False) -> str:
+    """Resolve model key for a tier using hardware- and language-aware routing.
 
     QUICK tier is intentionally adaptive:
     - CPU: `small.en` for lower end-to-end dictation latency
     - CUDA: `distil-large-v3` for stronger accuracy with good speed
+    When non-English languages are configured, English-only models are swapped
+    for their multilingual equivalents.
     """
     if tier == ModelTier.QUICK:
         device_norm = str(device or "cpu").strip().lower()
         if device_norm == "auto":
             device_norm = "cuda" if _cuda_runtime_ready() else "cpu"
         if device_norm != "cuda":
-            return "small.en"
-        return "distil-large-v3"
-    return TIER_MODELS.get(tier, "tiny.en")
+            key = "small.en"
+        else:
+            key = "distil-large-v3"
+    else:
+        key = TIER_MODELS.get(tier, "tiny.en")
+    if multilingual:
+        key = MULTILINGUAL_MODEL_FALLBACKS.get(key, key)
+    return key
 
 
 @dataclass
@@ -503,6 +562,32 @@ class FasterWhisperBackend(ASRBackend):
                 return str(local_prefetch)
         return resolved_id
 
+    def _select_language(self, audio: np.ndarray) -> Optional[str]:
+        """Pick the decode language from the configured task languages.
+
+        Single language: pinned directly. Multiple: detect the spoken language
+        and pick the most probable one among the configured set, so output is
+        never decoded in an unconfigured language. Returns None (full
+        auto-detect) only if detection fails.
+        """
+        langs = normalize_language_codes(getattr(self.config, "task_languages", ["en"]))
+        if len(langs) == 1:
+            return langs[0]
+        try:
+            detected, prob, all_probs = self._model.detect_language(audio)
+            probs = dict(all_probs) if all_probs else {}
+            if not probs:
+                return detected if detected in langs else langs[0]
+            best = max(langs, key=lambda lang: float(probs.get(lang, 0.0)))
+            logger.debug(
+                f"Language detection: raw={detected}({prob:.2f}) restricted->{best}"
+                f"({float(probs.get(best, 0.0)):.2f}) allowed={langs}"
+            )
+            return best
+        except Exception as e:
+            logger.warning(f"Restricted language detection failed ({e}); using auto-detect")
+            return None
+
     def transcribe(self, audio: np.ndarray, initial_prompt: Optional[str] = None, beam_size_override: Optional[int] = None, vad_filter_override: Optional[bool] = None) -> TranscriptionResult:
         if not self.is_loaded():
             self.load()
@@ -516,7 +601,7 @@ class FasterWhisperBackend(ASRBackend):
                 best_of = max(1, int(getattr(self.config, "best_of", 1)))
                 use_vad = vad_filter_override if vad_filter_override is not None else self.config.vad_filter
                 kwargs: Dict[str, Any] = {
-                    "language": "en",
+                    "language": self._select_language(audio),
                     "beam_size": beam_size,
                     "best_of": max(best_of, beam_size),
                     "temperature": float(getattr(self.config, "temperature", 0.0)),
@@ -888,12 +973,16 @@ class ASREngine:
         best_of: int = 1,
         temperature: float = 0.0,
         condition_on_previous_text: bool = False,
+        languages: Optional[List[str]] = None,
     ):
         """Initialize the ASR engine.
 
         Args:
             tier: Model tier (TINY, QUICK, BALANCED, QUALITY, VOXTRAL)
             model_name: Specific model name (overrides tier)
+            languages: Languages to transcribe (ISO codes). A single entry pins
+                that language; multiple entries auto-detect among them. Any
+                non-English entry routes tiers to multilingual models.
             device: "cpu", "cuda", or "auto"
             compute_type: "int8", "float16", or "float32"
             sample_rate: Audio sample rate (default 16000)
@@ -929,8 +1018,14 @@ class ASREngine:
         device = requested_device
         compute_type = resolved_compute
 
+        self.languages = normalize_language_codes(languages)
+        multilingual = languages_need_multilingual(self.languages)
+
         # Determine model to use
         if model_name:
+            if multilingual:
+                # Swap English-only models for multilingual equivalents.
+                model_name = MULTILINGUAL_MODEL_FALLBACKS.get(model_name, model_name)
             if model_name not in MODEL_CONFIGS:
                 # Check if it's a valid faster-whisper model
                 self.model_config = ModelConfig(
@@ -943,15 +1038,16 @@ class ASREngine:
             else:
                 self.model_config = MODEL_CONFIGS[model_name]
         elif tier:
-            model_key = resolve_tier_model_key(tier, device)
+            model_key = resolve_tier_model_key(tier, device, multilingual=multilingual)
             self.model_config = MODEL_CONFIGS[model_key]
         else:
             # Default to QUICK tier
-            self.model_config = MODEL_CONFIGS[resolve_tier_model_key(ModelTier.QUICK, device)]
+            self.model_config = MODEL_CONFIGS[resolve_tier_model_key(ModelTier.QUICK, device, multilingual=multilingual)]
 
         # Update device and compute type
         self.model_config.device = device
         self.model_config.compute_type = compute_type
+        self.model_config.task_languages = list(self.languages)
         self.model_config.vad_filter = vad_filter
         self.model_config.cpu_threads = cpu_threads
         self.model_config.asr_num_workers = asr_num_workers
@@ -1090,7 +1186,11 @@ class ASREngine:
         self.cleanup()
 
         # Update model config
+        languages = getattr(self, "languages", ["en"])
+        multilingual = languages_need_multilingual(languages)
         if model_name:
+            if multilingual:
+                model_name = MULTILINGUAL_MODEL_FALLBACKS.get(model_name, model_name)
             if model_name in MODEL_CONFIGS:
                 self.model_config = MODEL_CONFIGS[model_name]
             else:
@@ -1102,8 +1202,9 @@ class ASREngine:
                     compute_type=self.model_config.compute_type,
                 )
         elif tier:
-            model_key = resolve_tier_model_key(tier, self.model_config.device)
+            model_key = resolve_tier_model_key(tier, self.model_config.device, multilingual=multilingual)
             self.model_config = MODEL_CONFIGS[model_key]
+        self.model_config.task_languages = list(languages)
 
         # Create new backend
         self._create_backend()
@@ -1161,6 +1262,10 @@ class ModernWhisperASR(ASREngine):
         beam_size = getattr(cfg, 'beam_size', 1)
         temperature = getattr(cfg, 'temperature', 0.0)
         condition_on_previous_text = getattr(cfg, 'condition_on_previous_text', False)
+        languages = getattr(cfg, 'languages', None)
+        if not languages:
+            legacy_language = getattr(cfg, 'language', None)
+            languages = [legacy_language] if legacy_language else ["en"]
         force_cpu = str(os.environ.get("VOICEFLOW_FORCE_CPU", "")).strip().lower() in {"1", "true", "yes"}
         gpu_enabled = bool(getattr(cfg, "enable_gpu_acceleration", True))
 
@@ -1194,6 +1299,7 @@ class ModernWhisperASR(ASREngine):
                 beam_size=beam_size,
                 temperature=temperature,
                 condition_on_previous_text=condition_on_previous_text,
+                languages=languages,
             )
             logger.info(f"Using model tier '{model_tier}' -> {self.model_config.name}")
         else:
@@ -1208,6 +1314,7 @@ class ModernWhisperASR(ASREngine):
                 beam_size=beam_size,
                 temperature=temperature,
                 condition_on_previous_text=condition_on_previous_text,
+                languages=languages,
             )
         self.cfg = cfg
 

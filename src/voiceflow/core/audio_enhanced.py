@@ -10,7 +10,10 @@ import numpy as np
 import sounddevice as sd
 
 from voiceflow.core.config import Config
+from voiceflow.core.system_audio import SystemAudioCapture, system_audio_supported
 from voiceflow.utils.validation import validate_audio_data, validate_sample_rate, ValidationError
+
+VALID_AUDIO_SOURCES = ("mic", "system", "both")
 
 # Set up logging for audio validation
 logger = logging.getLogger(__name__)
@@ -421,7 +424,16 @@ class EnhancedAudioRecorder:
         self._pre_buffer = BoundedRingBuffer(self._pre_buffer_duration, cfg.sample_rate)
         self._continuous_stream: Optional[sd.InputStream] = None
         self._continuous_recording = False
-        
+
+        # SYSTEM AUDIO (WASAPI loopback): separate ring + pre-buffer so the mic
+        # and system tracks can be mixed at stop() when source is "both".
+        self._system_ring_buffer = BoundedRingBuffer(max_duration, cfg.sample_rate)
+        self._system_pre_buffer = BoundedRingBuffer(self._pre_buffer_duration, cfg.sample_rate)
+        self._system_capture: Optional[SystemAudioCapture] = None
+        self._system_recording = False
+        self._system_target: Optional[BoundedRingBuffer] = None
+        self._active_source = "mic"  # source the in-flight recording started with
+
         self._lock = threading.Lock()
         self._recording = False
         self._start_time = 0.0
@@ -493,50 +505,155 @@ class EnhancedAudioRecorder:
             logger.error(f"[AudioRecorder] Critical error in continuous callback: {e}")
             # Don't crash the audio stream - just skip this frame
 
+    def get_audio_source(self) -> str:
+        """Resolve the configured audio input source to a valid value."""
+        source = str(getattr(self.cfg, "audio_input_source", "mic")).strip().lower()
+        return source if source in VALID_AUDIO_SOURCES else "mic"
+
+    def set_audio_source(self, source: str):
+        """Switch audio source; takes effect immediately when idle, else next recording."""
+        source = str(source).strip().lower()
+        if source not in VALID_AUDIO_SOURCES:
+            logger.warning(f"[AudioRecorder] Invalid audio source: {source}")
+            return
+        self.cfg.audio_input_source = source
+        print(f"[AudioRecorder] Audio source set to: {source}")
+        if self._recording:
+            return  # applies on next recording
+        # Keep the right pre-buffers warm for the new source
+        if source == "system":
+            self.stop_continuous()
+        else:
+            self.start_continuous()
+        if source in ("system", "both"):
+            self._ensure_system_capture()
+        else:
+            self._stop_system_capture()
+
+    def _on_system_chunk(self, chunk: np.ndarray):
+        """Receive loopback chunks from the system capture thread."""
+        try:
+            data = audio_validation_guard(chunk, "SystemAudioChunk", allow_empty=True, cfg=self.cfg)
+            if data.size == 0:
+                return
+            self._system_pre_buffer.append(data)
+            if self._system_recording and self._system_target is not None:
+                self._system_target.append(data)
+        except Exception as e:
+            logger.error(f"[AudioRecorder] Critical error in system audio chunk: {e}")
+
+    def _ensure_system_capture(self) -> bool:
+        if self._system_capture is None:
+            self._system_capture = SystemAudioCapture(
+                sample_rate=self.cfg.sample_rate,
+                blocksize=self.cfg.blocksize,
+                on_chunk=self._on_system_chunk,
+            )
+        if not self._system_capture.is_running():
+            self._system_pre_buffer.clear()
+            return self._system_capture.start()
+        return True
+
+    def _stop_system_capture(self):
+        self._system_recording = False
+        self._system_target = None
+        if self._system_capture is not None and self._system_capture.is_running():
+            self._system_capture.stop()
+        self._system_pre_buffer.clear()
+
+    @staticmethod
+    def _rms(audio: np.ndarray) -> float:
+        if audio.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(np.square(audio.astype(np.float64)))))
+
+    @staticmethod
+    def _mix_tracks(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Mix two mono tracks of (possibly) different lengths into one."""
+        if a.size == 0:
+            return b
+        if b.size == 0:
+            return a
+        n = max(len(a), len(b))
+        mixed = np.zeros(n, dtype=np.float32)
+        mixed[: len(a)] += a
+        mixed[: len(b)] += b
+        return np.clip(mixed, -1.0, 1.0)
+
+    @staticmethod
+    def _trim_pre_buffer(pre_buffer_data: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Keep the most recent slice of a pre-buffer for key-press timing."""
+        min_pre_buffer_samples = int(0.3 * sample_rate)  # 300ms minimum
+        if len(pre_buffer_data) > min_pre_buffer_samples:
+            # Use recent 800ms of pre-buffer for optimal key-press timing
+            recent_samples = int(0.8 * sample_rate)
+            pre_buffer_data = pre_buffer_data[-recent_samples:]
+        return pre_buffer_data
+
     def start(self):
         """Start recording with pre-buffer integration"""
         if self._recording:
             return
 
-        print("[AudioRecorder] Starting enhanced recording with pre-buffer...")
+        source = self.get_audio_source()
+        if source in ("system", "both") and not system_audio_supported():
+            print("[AudioRecorder] System audio capture unavailable (soundcard missing); using mic only")
+            source = "mic"
+        mic_on = source in ("mic", "both")
+        system_on = source in ("system", "both")
+        self._active_source = source
+
+        print(f"[AudioRecorder] Starting enhanced recording with pre-buffer (source: {source})...")
 
         # CRITICAL FIX: Clear main buffer before starting to prevent old data corruption
         self._ring_buffer.clear()
-        
-        # Start continuous recording if not already running
-        if not self._continuous_recording:
-            self.start_continuous()
-        
-        # Get pre-buffer data BEFORE clearing to use for this recording
-        pre_buffer_data = self._pre_buffer.get_data()
-        
-        # CRITICAL FIX: Clear pre-buffer IMMEDIATELY after getting data
-        # This prevents any accumulation while we process
-        self._pre_buffer.clear()
-        
-        if len(pre_buffer_data) > 0:
-            # Take only the most recent portion to minimize latency
-            min_pre_buffer_samples = int(0.3 * self.cfg.sample_rate)  # 300ms minimum
-            if len(pre_buffer_data) > min_pre_buffer_samples:
-                # Use recent 800ms of pre-buffer for optimal key-press timing
-                recent_samples = int(0.8 * self.cfg.sample_rate)
-                pre_buffer_data = pre_buffer_data[-recent_samples:]
-            
-            # Add pre-buffer to main buffer for this recording only
-            self._ring_buffer.append(pre_buffer_data)
-        
+        self._system_ring_buffer.clear()
+
+        if system_on:
+            started = self._ensure_system_capture()
+            if not started and not mic_on:
+                print("[AudioRecorder] System capture failed to start; falling back to mic")
+                source = self._active_source = "mic"
+                mic_on, system_on = True, False
+            elif started:
+                # In "system" mode the loopback feeds the main ring buffer directly so
+                # streaming previews and duration tracking keep working; in "both" mode
+                # it goes to its own ring and is mixed with the mic track at stop().
+                self._system_target = self._ring_buffer if source == "system" else self._system_ring_buffer
+                system_pre = self._system_pre_buffer.get_data()
+                self._system_pre_buffer.clear()
+                if len(system_pre) > 0:
+                    self._system_target.append(self._trim_pre_buffer(system_pre, self.cfg.sample_rate))
+                self._system_recording = True
+
         self._callback_count = 0
         self._total_frames = 0
         self._start_time = time.time()
-        
-        self._stream = sd.InputStream(
-            channels=self.cfg.channels,
-            samplerate=self.cfg.sample_rate,
-            dtype="float32",
-            blocksize=self.cfg.blocksize,
-            callback=self._callback,
-        )
-        self._stream.start()
+
+        if mic_on:
+            # Start continuous recording if not already running
+            if not self._continuous_recording:
+                self.start_continuous()
+
+            # Get pre-buffer data BEFORE clearing to use for this recording
+            pre_buffer_data = self._pre_buffer.get_data()
+
+            # CRITICAL FIX: Clear pre-buffer IMMEDIATELY after getting data
+            # This prevents any accumulation while we process
+            self._pre_buffer.clear()
+
+            if len(pre_buffer_data) > 0:
+                # Add pre-buffer to main buffer for this recording only
+                self._ring_buffer.append(self._trim_pre_buffer(pre_buffer_data, self.cfg.sample_rate))
+
+            self._stream = sd.InputStream(
+                channels=self.cfg.channels,
+                samplerate=self.cfg.sample_rate,
+                dtype="float32",
+                blocksize=self.cfg.blocksize,
+                callback=self._callback,
+            )
+            self._stream.start()
         self._recording = True
         print(f"[AudioRecorder] Recording started successfully with pre-buffer integration")
 
@@ -551,17 +668,32 @@ class EnhancedAudioRecorder:
 
         try:
             self._recording = False
+            self._system_recording = False
+            self._system_target = None
             if self._stream is not None:
                 self._stream.stop()
                 self._stream.close()
                 self._stream = None
-            
+
             # Get the recorded audio data
             audio_data = self._ring_buffer.get_data()
+            if self._active_source == "both":
+                system_data = self._system_ring_buffer.get_data()
+                if len(system_data) > 0:
+                    print(
+                        f"[AudioRecorder] Mixing mic ({len(audio_data)} samples, rms={self._rms(audio_data):.4f}) "
+                        f"+ system ({len(system_data)} samples, rms={self._rms(system_data):.4f})"
+                    )
+                else:
+                    print("[AudioRecorder] System track empty (nothing played on default output?)")
+                audio_data = self._mix_tracks(audio_data, system_data)
+            elif self._active_source == "system":
+                print(f"[AudioRecorder] System track: {len(audio_data)} samples, rms={self._rms(audio_data):.4f}")
             duration = len(audio_data) / self.cfg.sample_rate
-            
+
             # CRITICAL FIX: Clear buffer after getting data to prevent accumulation
             self._ring_buffer.clear()
+            self._system_ring_buffer.clear()
             print(f"[AudioRecorder] Buffer cleared after extraction to prevent accumulation")
             
             # Performance summary

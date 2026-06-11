@@ -406,11 +406,48 @@ class EnhancedTrayController(ITrayManager):
             ),
         )
 
+        # Audio input source selection (mic / system loopback / both).
+        # Click-to-cycle top-level item: submenus fail to open on some
+        # Windows tray setups, so avoid them for this control.
+        _AUDIO_SOURCE_ORDER = ["mic", "system", "both"]
+        _AUDIO_SOURCE_LABELS = {
+            "mic": "Microphone",
+            "system": "System Audio",
+            "both": "Mic + System",
+        }
+
+        def _current_audio_source() -> str:
+            source = str(getattr(self.app.cfg, "audio_input_source", "mic")).strip().lower()
+            return source if source in _AUDIO_SOURCE_ORDER else "mic"
+
+        def cycle_audio_source(icon, item):  # noqa: ARG001
+            current = _current_audio_source()
+            new_source = _AUDIO_SOURCE_ORDER[
+                (_AUDIO_SOURCE_ORDER.index(current) + 1) % len(_AUDIO_SOURCE_ORDER)
+            ]
+            self.app.cfg.audio_input_source = new_source
+            try:
+                from voiceflow.utils.settings import save_config
+                save_config(self.app.cfg)
+            except Exception:
+                pass
+            rec = getattr(self.app, "rec", None)
+            if rec is not None and hasattr(rec, "set_audio_source"):
+                try:
+                    rec.set_audio_source(new_source)
+                except Exception as e:
+                    print(f"[Tray] Failed to apply audio source: {e}")
+            self._notify("VoiceFlow", f"Audio source: {_AUDIO_SOURCE_LABELS[new_source]}")
+
         return pystray.Menu(
             pystray.MenuItem(
                 lambda item: f"Code Mode: {'ON' if self.app.code_mode else 'OFF'}",
                 toggle_code_mode,
                 checked=lambda item: self.app.code_mode,
+            ),
+            pystray.MenuItem(
+                lambda item: f"Audio Source: {_AUDIO_SOURCE_LABELS[_current_audio_source()]}",
+                cycle_audio_source,
             ),
             pystray.MenuItem(
                 lambda item: f"Injection: {'Paste' if self.app.cfg.paste_injection else 'Type'}",
