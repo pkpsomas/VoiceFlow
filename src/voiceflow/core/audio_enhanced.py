@@ -437,6 +437,8 @@ class EnhancedAudioRecorder:
         self._lock = threading.Lock()
         self._recording = False
         self._start_time = 0.0
+        # Per-track RMS of the last completed recording, keyed by source name.
+        self.last_track_rms: dict = {}
         
         # Performance monitoring
         self._callback_count = 0
@@ -509,6 +511,37 @@ class EnhancedAudioRecorder:
         """Resolve the configured audio input source to a valid value."""
         source = str(getattr(self.cfg, "audio_input_source", "mic")).strip().lower()
         return source if source in VALID_AUDIO_SOURCES else "mic"
+
+    def _resolve_input_device(self):
+        """Map the configured input_device name (substring) to a device index.
+
+        Returns None (PortAudio default) when unset or unmatched.
+        """
+        preferred = getattr(self.cfg, "input_device", None)
+        if not preferred:
+            return None
+        needle = str(preferred).strip().lower()
+        if not needle:
+            return None
+        try:
+            for idx, dev in enumerate(sd.query_devices()):
+                if dev.get("max_input_channels", 0) > 0 and needle in str(dev.get("name", "")).lower():
+                    return idx
+        except Exception as e:
+            logger.warning(f"[AudioRecorder] Input device lookup failed: {e}")
+        print(f"[AudioRecorder] Input device {preferred!r} not found; using system default")
+        return None
+
+    def set_input_device(self, device_name):
+        """Switch the mic device; applies on the next stream open."""
+        self.cfg.input_device = device_name or None
+        print(f"[AudioRecorder] Input device set to: {device_name or 'system default'}")
+        if not self._recording:
+            # Restart the continuous pre-buffer so it picks up the new device.
+            if self._continuous_recording:
+                self.stop_continuous()
+                if self.get_audio_source() in ("mic", "both"):
+                    self.start_continuous()
 
     def set_audio_source(self, source: str):
         """Switch audio source; takes effect immediately when idle, else next recording."""
@@ -647,6 +680,7 @@ class EnhancedAudioRecorder:
                 self._ring_buffer.append(self._trim_pre_buffer(pre_buffer_data, self.cfg.sample_rate))
 
             self._stream = sd.InputStream(
+                device=self._resolve_input_device(),
                 channels=self.cfg.channels,
                 samplerate=self.cfg.sample_rate,
                 dtype="float32",
@@ -679,16 +713,20 @@ class EnhancedAudioRecorder:
             audio_data = self._ring_buffer.get_data()
             if self._active_source == "both":
                 system_data = self._system_ring_buffer.get_data()
+                self.last_track_rms = {"mic": self._rms(audio_data), "system": self._rms(system_data)}
                 if len(system_data) > 0:
                     print(
-                        f"[AudioRecorder] Mixing mic ({len(audio_data)} samples, rms={self._rms(audio_data):.4f}) "
-                        f"+ system ({len(system_data)} samples, rms={self._rms(system_data):.4f})"
+                        f"[AudioRecorder] Mixing mic ({len(audio_data)} samples, rms={self.last_track_rms['mic']:.4f}) "
+                        f"+ system ({len(system_data)} samples, rms={self.last_track_rms['system']:.4f})"
                     )
                 else:
                     print("[AudioRecorder] System track empty (nothing played on default output?)")
                 audio_data = self._mix_tracks(audio_data, system_data)
             elif self._active_source == "system":
-                print(f"[AudioRecorder] System track: {len(audio_data)} samples, rms={self._rms(audio_data):.4f}")
+                self.last_track_rms = {"system": self._rms(audio_data)}
+                print(f"[AudioRecorder] System track: {len(audio_data)} samples, rms={self.last_track_rms['system']:.4f}")
+            else:
+                self.last_track_rms = {"mic": self._rms(audio_data)}
             duration = len(audio_data) / self.cfg.sample_rate
 
             # CRITICAL FIX: Clear buffer after getting data to prevent accumulation
@@ -728,6 +766,7 @@ class EnhancedAudioRecorder:
         self._pre_buffer.clear()
         
         self._continuous_stream = sd.InputStream(
+            device=self._resolve_input_device(),
             channels=self.cfg.channels,
             samplerate=self.cfg.sample_rate,
             dtype="float32",

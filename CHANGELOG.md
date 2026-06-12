@@ -11,7 +11,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Multi-language transcription** — new `languages` config (ISO codes, e.g. `["en", "el"]`): one entry pins that language, multiple entries auto-detect per utterance restricted to the configured set; English-only models (`small.en`, `tiny.en`, distil) are automatically swapped for multilingual equivalents (`small`, `tiny`, `large-v3-turbo`) when a non-English language is configured
 - **Audio source selection** — transcribe from the microphone, incoming system audio (WASAPI loopback of the default output device via `soundcard`), or both mixed into one track; switch from tray → Audio Source, persisted as `audio_input_source` in config
 - **System audio pre-buffer** — loopback capture keeps the same 1.5 s pre-buffer as the mic, so incoming speech just before the hotkey press is not lost
-- **"No speech detected" feedback** — empty transcriptions show a brief overlay/tray notice instead of silently going idle; recording log prints per-track RMS to expose silent sources
+- **"No speech detected" feedback** — empty transcriptions show a brief overlay/tray notice instead of silently going idle; recording log prints per-track RMS to expose silent sources; the notice names the silent source (mic vs system) when track levels are near zero
+- **Microphone device selection** — new tray submenu (Microphone Device) and `input_device` config to record from a specific mic by name instead of the system default, e.g. when a headset's inline mute makes the default mic silent
 
 ### Fixed
 - **Missing dependency** — `psutil` is imported by `process_monitor` but was absent from `pyproject.toml`; fresh installs crashed at launch

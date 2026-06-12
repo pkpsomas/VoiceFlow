@@ -2865,9 +2865,18 @@ class EnhancedApp:
             # silent source (e.g. system audio with nothing playing) is obvious.
             # "complete" status auto-resets to idle after 2s via the tray timer.
             if not text.strip() and self.visual_indicators_enabled:
-                update_tray_status(self.tray_controller, "complete", False, "No speech detected")
+                message = "No speech detected"
+                try:
+                    levels = dict(getattr(self.rec, "last_track_rms", {}) or {})
+                    if levels.get("mic", 1.0) < 1e-3:
+                        message = "No speech — mic is silent (muted?)"
+                    elif levels.get("system", 1.0) < 1e-3:
+                        message = "No speech — system audio is silent"
+                except Exception:
+                    pass
+                update_tray_status(self.tray_controller, "complete", False, message)
                 if VISUAL_INDICATORS_AVAILABLE:
-                    show_complete("No speech detected")
+                    show_complete(message)
 
             self._last_transcription_completed_at = time.time()
             return text

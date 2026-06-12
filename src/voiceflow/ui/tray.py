@@ -252,6 +252,60 @@ class TrayController:
             ),
         )
 
+        # Microphone device selection (WASAPI input devices + system default).
+        def list_input_devices():
+            try:
+                import sounddevice as sd
+                apis = sd.query_hostapis()
+                names = []
+                for dev in sd.query_devices():
+                    if (
+                        dev.get("max_input_channels", 0) > 0
+                        and apis[dev["hostapi"]]["name"] == "Windows WASAPI"
+                        and dev["name"] not in names
+                    ):
+                        names.append(dev["name"])
+                return names
+            except Exception as e:
+                print(f"[Tray] Input device enumeration failed: {e}")
+                return []
+
+        def set_input_device(device_name):
+            self.app.cfg.input_device = device_name
+            try:
+                from voiceflow.utils.settings import save_config
+                save_config(self.app.cfg)
+            except Exception:
+                pass
+            rec = getattr(self.app, "rec", None)
+            if rec is not None and hasattr(rec, "set_input_device"):
+                try:
+                    rec.set_input_device(device_name)
+                except Exception as e:
+                    print(f"[Tray] Failed to apply input device: {e}")
+            self._notify("VoiceFlow", f"Microphone: {device_name or 'System Default'}")
+
+        def is_input_device(device_name) -> bool:
+            current = getattr(self.app.cfg, "input_device", None) or None
+            return current == (device_name or None)
+
+        mic_device_items = [
+            pystray.MenuItem(
+                lambda item: "System Default",
+                lambda icon, item: set_input_device(None),
+                checked=lambda item: is_input_device(None),
+            )
+        ]
+        for device_name in list_input_devices():
+            mic_device_items.append(
+                pystray.MenuItem(
+                    lambda item, _n=device_name: _n,
+                    lambda icon, item, _n=device_name: set_input_device(_n),
+                    checked=lambda item, _n=device_name: is_input_device(_n),
+                )
+            )
+        mic_device_menu = pystray.Menu(*mic_device_items)
+
         def open_setup_defaults(icon, item):  # noqa: ARG001
             def _run():
                 try:
@@ -289,6 +343,7 @@ class TrayController:
                 checked=lambda item: self.app.cfg.press_enter_after_paste,
             ),
             pystray.MenuItem("Audio Source", audio_source_menu),
+            pystray.MenuItem("Microphone Device", mic_device_menu),
             pystray.MenuItem("PTT Hotkey", ptt_menu),
             pystray.MenuItem("Switch Model", model_menu),
             pystray.MenuItem("Set Ctrl+Alt as default PTT", set_ctrl_alt_default),
