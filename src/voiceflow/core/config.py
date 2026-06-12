@@ -283,6 +283,7 @@ class Config:
     # entries auto-detect among them per utterance. Non-English entries require
     # multilingual models (tier routing handles this automatically).
     languages: list = field(default_factory=lambda: ["en"])
+    non_english_beam_size: int = 5  # wider beam for non-English decodes (greedy hurts them most)
     verbose: bool = True
     code_mode_default: bool = True
     code_mode_lowercase: bool = True

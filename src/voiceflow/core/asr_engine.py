@@ -239,6 +239,7 @@ class ModelConfig:
     languages: List[str] = field(default_factory=lambda: ["en"])
     # Languages the user wants decoded (decode preference, not model capability).
     task_languages: List[str] = field(default_factory=lambda: ["en"])
+    non_english_beam_size: int = 5
     supports_diarization: bool = False
     supports_word_timestamps: bool = True
     vad_filter: bool = True
@@ -600,8 +601,18 @@ class FasterWhisperBackend(ASRBackend):
                 beam_size = max(1, int(beam_size_override)) if beam_size_override else max(1, int(getattr(self.config, "beam_size", 1)))
                 best_of = max(1, int(getattr(self.config, "best_of", 1)))
                 use_vad = vad_filter_override if vad_filter_override is not None else self.config.vad_filter
+                language = self._select_language(audio)
+                if language and language != "en":
+                    # Greedy decoding disproportionately degrades non-English
+                    # output on the smaller models; widen the beam for quality.
+                    beam_size = max(beam_size, max(1, int(getattr(self.config, "non_english_beam_size", 5))))
+                    if initial_prompt:
+                        # Learned context prompts are English-biased and steer
+                        # non-English decodes toward transliteration; drop them.
+                        initial_prompt = None
+                    print(f"[ASR] Decoding language: {language} (beam {beam_size})")
                 kwargs: Dict[str, Any] = {
-                    "language": self._select_language(audio),
+                    "language": language,
                     "beam_size": beam_size,
                     "best_of": max(best_of, beam_size),
                     "temperature": float(getattr(self.config, "temperature", 0.0)),
@@ -974,6 +985,7 @@ class ASREngine:
         temperature: float = 0.0,
         condition_on_previous_text: bool = False,
         languages: Optional[List[str]] = None,
+        non_english_beam_size: int = 5,
     ):
         """Initialize the ASR engine.
 
@@ -1048,6 +1060,7 @@ class ASREngine:
         self.model_config.device = device
         self.model_config.compute_type = compute_type
         self.model_config.task_languages = list(self.languages)
+        self.model_config.non_english_beam_size = max(1, int(non_english_beam_size))
         self.model_config.vad_filter = vad_filter
         self.model_config.cpu_threads = cpu_threads
         self.model_config.asr_num_workers = asr_num_workers
@@ -1266,6 +1279,7 @@ class ModernWhisperASR(ASREngine):
         if not languages:
             legacy_language = getattr(cfg, 'language', None)
             languages = [legacy_language] if legacy_language else ["en"]
+        non_english_beam_size = getattr(cfg, 'non_english_beam_size', 5)
         force_cpu = str(os.environ.get("VOICEFLOW_FORCE_CPU", "")).strip().lower() in {"1", "true", "yes"}
         gpu_enabled = bool(getattr(cfg, "enable_gpu_acceleration", True))
 
@@ -1300,6 +1314,7 @@ class ModernWhisperASR(ASREngine):
                 temperature=temperature,
                 condition_on_previous_text=condition_on_previous_text,
                 languages=languages,
+                non_english_beam_size=non_english_beam_size,
             )
             logger.info(f"Using model tier '{model_tier}' -> {self.model_config.name}")
         else:
@@ -1315,6 +1330,7 @@ class ModernWhisperASR(ASREngine):
                 temperature=temperature,
                 condition_on_previous_text=condition_on_previous_text,
                 languages=languages,
+                non_english_beam_size=non_english_beam_size,
             )
         self.cfg = cfg
 
