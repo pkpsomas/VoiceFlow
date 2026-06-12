@@ -482,6 +482,20 @@ class EnhancedTrayController(ITrayManager):
             current = getattr(self.app.cfg, "input_device", None) or None
             return current == (device_name or None)
 
+        def make_device_item(device_name):
+            # pystray rejects actions with more than two parameters, so bind the
+            # device name via closure instead of a defaulted lambda argument.
+            def _label(item):  # noqa: ARG001
+                return device_name
+
+            def _activate(icon, item):  # noqa: ARG001
+                set_input_device(device_name)
+
+            def _checked(item):  # noqa: ARG001
+                return is_input_device(device_name)
+
+            return pystray.MenuItem(_label, _activate, checked=_checked)
+
         mic_device_items = [
             pystray.MenuItem(
                 lambda item: "System Default",
@@ -490,13 +504,7 @@ class EnhancedTrayController(ITrayManager):
             )
         ]
         for device_name in list_input_devices():
-            mic_device_items.append(
-                pystray.MenuItem(
-                    lambda item, _n=device_name: _n,
-                    lambda icon, item, _n=device_name: set_input_device(_n),
-                    checked=lambda item, _n=device_name: is_input_device(_n),
-                )
-            )
+            mic_device_items.append(make_device_item(device_name))
         mic_device_menu = pystray.Menu(*mic_device_items)
 
         return pystray.Menu(
