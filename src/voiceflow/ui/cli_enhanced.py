@@ -371,6 +371,9 @@ try:
         set_correction_feedback_handler as visual_set_correction_feedback_handler,
     )
     from voiceflow.ui.visual_indicators import (
+        set_recording_toggle_handler as visual_set_recording_toggle_handler,
+    )
+    from voiceflow.ui.visual_indicators import (
         set_dock_enabled as visual_set_dock_enabled,
     )
     from voiceflow.ui.visual_indicators import (
@@ -402,6 +405,7 @@ except ImportError:
     def visual_set_dock_enabled(enabled): pass
     def visual_set_animation_preferences(quality="auto", reduced_motion=False, target_fps=28): pass
     def visual_set_correction_feedback_handler(handler): pass
+    def visual_set_recording_toggle_handler(handler): pass
 
 
 class EnhancedTranscriptionManager:
@@ -705,6 +709,29 @@ class EnhancedApp:
         """Optional low-latency ASR path for short utterances."""
         if not getattr(self.cfg, "latency_boost_enabled", True):
             return
+
+        transcriber_pref = str(
+            os.environ.get("VOICEFLOW_TRANSCRIBER", "")
+            or getattr(self.cfg, "asr_backend", "")
+            or "local"
+        ).strip().lower()
+        if transcriber_pref == "soniox":
+            # Cloud backend has no local fast/slow tier split.
+            print("[MODEL] Fast path disabled (Soniox cloud transcriber active)")
+            return
+
+        try:
+            from voiceflow.core.asr_engine import (
+                languages_need_multilingual,
+                normalize_language_codes,
+            )
+            if languages_need_multilingual(normalize_language_codes(getattr(self.cfg, "languages", None))):
+                # The tiny fast model is unusable for non-English speech; short
+                # utterances must go to the primary multilingual model instead.
+                print("[MODEL] Fast path disabled (non-English languages configured)")
+                return
+        except Exception:
+            pass
 
         fast_tier = str(getattr(self.cfg, "latency_boost_model_tier", "tiny")).strip().lower()
         base_tier = str(getattr(self.cfg, "model_tier", "quick")).strip().lower()
@@ -1984,6 +2011,19 @@ class EnhancedApp:
             return
         self._observe_adaptive_async(raw, corrected, meta)
 
+    def toggle_recording(self):
+        """Hands-free start/stop used by the dock record button.
+
+        Mirrors a PTT press/release pair so the full pipeline (preview,
+        transcription, injection) behaves identically.
+        """
+        if self.rec.is_recording():
+            print("[MIC] Dock toggle: stopping recording")
+            self.stop_recording()
+        else:
+            print("[MIC] Dock toggle: starting recording")
+            self.start_recording()
+
     def start_recording(self):
         """Enhanced recording start with better error handling"""
         try:
@@ -2987,6 +3027,12 @@ def main(argv=None):
     _start_bootstrap_parent_watchdog()
     _start_single_instance_watchdog(interval_seconds=2.0)
 
+    try:
+        from voiceflow.utils.env import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
+
     cfg = load_config(Config())
     setup_saved, _setup_restart_required = maybe_run_startup_setup(cfg)
     if setup_saved:
@@ -3092,6 +3138,10 @@ def main(argv=None):
             visual_set_correction_feedback_handler(app.handle_manual_correction_feedback)
         except Exception:
             runtime_log.exception("visual_correction_feedback_handler_register_failed")
+        try:
+            visual_set_recording_toggle_handler(app.toggle_recording)
+        except Exception:
+            runtime_log.exception("visual_recording_toggle_handler_register_failed")
 
     # Enhanced tray support with visual indicators
     tray = None
@@ -3200,6 +3250,10 @@ def main(argv=None):
             visual_set_correction_feedback_handler(None)
         except Exception:
             pass
+        try:
+            visual_set_recording_toggle_handler(None)
+        except Exception:
+            pass
         return 0
 
     try:
@@ -3269,6 +3323,10 @@ def main(argv=None):
             pass
         try:
             visual_set_correction_feedback_handler(None)
+        except Exception:
+            pass
+        try:
+            visual_set_recording_toggle_handler(None)
         except Exception:
             pass
 

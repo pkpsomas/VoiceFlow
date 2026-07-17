@@ -190,6 +190,15 @@ def set_correction_feedback_handler(handler: Optional[Callable[[str, str, Dict[s
     _CORRECTION_FEEDBACK_HANDLER = handler
 
 
+_RECORDING_TOGGLE_HANDLER: Optional[Callable[[], None]] = None
+
+
+def set_recording_toggle_handler(handler: Optional[Callable[[], None]]) -> None:
+    """Register the app callback invoked by the dock's record toggle button."""
+    global _RECORDING_TOGGLE_HANDLER
+    _RECORDING_TOGGLE_HANDLER = handler
+
+
 def _emit_correction_feedback_learning(original_text: str, corrected_text: str, metadata: Dict[str, Any]) -> None:
     handler = _CORRECTION_FEEDBACK_HANDLER
     if not handler:
@@ -1394,8 +1403,36 @@ class BottomScreenIndicator:
             bd=0,
         )
         minimize_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=2)
+
+        # Hands-free record toggle: start/stop transcription without holding
+        # the PTT keys. Lands between the status label and Hide/History.
+        self.dock_record_btn = tk.Button(
+            dock_frame,
+            text="● Rec",
+            command=self._on_dock_record_toggle,
+            bg=self._ui("panel_surface"),
+            fg=self._ui("text_secondary"),
+            activebackground=self._ui("panel_surface_alt"),
+            activeforeground=self._ui("text_primary"),
+            relief=tk.FLAT,
+            padx=8,
+            pady=1,
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+            highlightthickness=0,
+            bd=0,
+        )
+        self.dock_record_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=2)
         if not self.dock_enabled:
             self.dock_window.withdraw()
+
+    def _on_dock_record_toggle(self):
+        handler = _RECORDING_TOGGLE_HANDLER
+        if not handler:
+            return
+        # Recording start/stop does real work (audio streams, transcription
+        # dispatch); keep it off the Tk thread.
+        threading.Thread(target=handler, daemon=True, name="DockRecordToggle").start()
 
     def _setup_history_panel(self, screen_width: int, screen_height: int):
         """Quick recent-transcription panel opened from the dock."""
@@ -2873,6 +2910,15 @@ class BottomScreenIndicator:
         elif status_value in ("listening", "processing", "transcribing", "complete"):
             tail = "Live"
         self.dock_var.set(f"{status_label} | {tail}")
+        record_btn = getattr(self, "dock_record_btn", None)
+        if record_btn is not None:
+            try:
+                if status_value == "listening":
+                    record_btn.configure(text="■ Stop", fg=self._ui("warning"))
+                else:
+                    record_btn.configure(text="● Rec", fg=self._ui("text_secondary"))
+            except Exception:
+                pass
 
     @with_error_recovery(fallback_value=None)
     def show_status(self, status: TranscriptionStatus, message: str = None, duration: float = None):

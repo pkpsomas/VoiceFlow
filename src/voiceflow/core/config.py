@@ -284,6 +284,16 @@ class Config:
     # multilingual models (tier routing handles this automatically).
     languages: list = field(default_factory=lambda: ["en"])
     non_english_beam_size: int = 5  # wider beam for non-English decodes (greedy hurts them most)
+    # ASR backend: "local" (faster-whisper, default) or "soniox" (cloud API with
+    # native multilingual/code-switch support). Env VOICEFLOW_TRANSCRIBER overrides.
+    asr_backend: str = "local"
+    soniox_api_key: str = ""  # prefer env SONIOX_API_KEY; config value is a fallback
+    # Seed prompt per non-English language code, used when decoding that language.
+    # Mixed-script seeds bias Whisper to keep embedded English terms in Latin
+    # script (code-switching) instead of transliterating them.
+    mixed_language_prompts: dict = field(default_factory=lambda: {
+        "el": "Σημείωση: θα κάνω update το document και θα στείλω email με το link στο team.",
+    })
     verbose: bool = True
     code_mode_default: bool = True
     code_mode_lowercase: bool = True

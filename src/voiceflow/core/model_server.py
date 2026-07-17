@@ -124,6 +124,12 @@ def _load_models(state: _ModelState) -> None:
         from voiceflow.core.asr_engine import ModernWhisperASR
         from voiceflow.utils.settings import load_config
 
+        try:
+            from voiceflow.utils.env import load_dotenv
+            load_dotenv()
+        except Exception:
+            pass
+
         cfg = load_config(Config())
         tier = getattr(cfg, "model_tier", "quick")
         logger.info("model_server: loading primary model (tier=%s)", tier)
@@ -134,9 +140,22 @@ def _load_models(state: _ModelState) -> None:
         logger.info("model_server: primary model ready")
         print("[model-server] Primary model ready", flush=True)
 
-        # Optionally load the fast (latency-boost) model
+        # Optionally load the fast (latency-boost) model. Skipped for
+        # non-English configs: the tiny model is unusable for those languages.
+        from voiceflow.core.asr_engine import (
+            languages_need_multilingual,
+            normalize_language_codes,
+        )
+        multilingual = languages_need_multilingual(
+            normalize_language_codes(getattr(cfg, "languages", None))
+        )
+        transcriber_pref = str(
+            os.environ.get("VOICEFLOW_TRANSCRIBER", "")
+            or getattr(cfg, "asr_backend", "")
+            or "local"
+        ).strip().lower()
         fast_asr = None
-        if getattr(cfg, "latency_boost_enabled", True):
+        if getattr(cfg, "latency_boost_enabled", True) and not multilingual and transcriber_pref != "soniox":
             fast_tier = str(getattr(cfg, "latency_boost_model_tier", "tiny")).strip().lower()
             base_tier = str(getattr(cfg, "model_tier", "quick")).strip().lower()
             if fast_tier != base_tier:

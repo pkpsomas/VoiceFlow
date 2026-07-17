@@ -13,6 +13,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **System audio pre-buffer** — loopback capture keeps the same 1.5 s pre-buffer as the mic, so incoming speech just before the hotkey press is not lost
 - **"No speech detected" feedback** — empty transcriptions show a brief overlay/tray notice instead of silently going idle; recording log prints per-track RMS to expose silent sources; the notice names the silent source (mic vs system) when track levels are near zero
 - **Microphone device selection** — new tray submenu (Microphone Device) and `input_device` config to record from a specific mic by name instead of the system default, e.g. when a headset's inline mute makes the default mic silent
+- **Soniox cloud transcriber** — optional backend (`VOICEFLOW_TRANSCRIBER=soniox` env or `asr_backend` config, key via `SONIOX_API_KEY`) with native multilingual and code-switched speech support; `.env` at the repo root is now loaded at startup; uploaded audio/transcripts are deleted from the service after each request
+- **Dock record toggle** — a Record/Stop button in the always-on dock starts and stops transcription hands-free, without holding the PTT keys
+- **Mixed-language decode seeds** — configurable per-language seed prompts (`mixed_language_prompts`) bias local Whisper decodes to keep embedded English terms in Latin script; the tiny fast-path model is disabled when non-English languages are configured
 
 ### Fixed
 - **Missing dependency** — `psutil` is imported by `process_monitor` but was absent from `pyproject.toml`; fresh installs crashed at launch

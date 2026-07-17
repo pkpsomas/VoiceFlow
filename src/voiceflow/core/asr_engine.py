@@ -240,6 +240,8 @@ class ModelConfig:
     # Languages the user wants decoded (decode preference, not model capability).
     task_languages: List[str] = field(default_factory=lambda: ["en"])
     non_english_beam_size: int = 5
+    mixed_language_prompts: Dict[str, str] = field(default_factory=dict)
+    api_key: str = ""  # cloud backends only
     supports_diarization: bool = False
     supports_word_timestamps: bool = True
     vad_filter: bool = True
@@ -339,6 +341,16 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         size_mb=3000,
         supports_diarization=True,
         supports_word_timestamps=True,
+    ),
+
+    # Cloud backends
+    "soniox": ModelConfig(
+        name="Soniox (cloud)",
+        model_id="stt-async-v5",
+        backend="soniox",
+        description="Soniox async STT API: native multilingual and code-switching",
+        size_mb=0,
+        languages=["multilingual"],
     ),
 
     # Voxtral models (Mistral AI - July 2025)
@@ -606,11 +618,13 @@ class FasterWhisperBackend(ASRBackend):
                     # Greedy decoding disproportionately degrades non-English
                     # output on the smaller models; widen the beam for quality.
                     beam_size = max(beam_size, max(1, int(getattr(self.config, "non_english_beam_size", 5))))
-                    if initial_prompt:
-                        # Learned context prompts are English-biased and steer
-                        # non-English decodes toward transliteration; drop them.
-                        initial_prompt = None
-                    print(f"[ASR] Decoding language: {language} (beam {beam_size})")
+                    # Learned context prompts are English-biased and steer
+                    # non-English decodes toward transliteration. Swap in the
+                    # per-language code-switch seed (if configured) so embedded
+                    # English terms stay in Latin script.
+                    prompts = getattr(self.config, "mixed_language_prompts", None) or {}
+                    initial_prompt = prompts.get(language) or None
+                    print(f"[ASR] Decoding language: {language} (beam {beam_size}, seed prompt: {'yes' if initial_prompt else 'no'})")
                 kwargs: Dict[str, Any] = {
                     "language": language,
                     "beam_size": beam_size,
@@ -692,6 +706,143 @@ class FasterWhisperBackend(ASRBackend):
             self._retried_cpu_fallback = True
             logging.getLogger("voiceflow").warning("asr_runtime_fallback device=cpu compute=int8")
         self.load()
+
+
+class SonioxBackend(ASRBackend):
+    """Cloud backend using the Soniox async STT API.
+
+    Unlike Whisper, Soniox natively supports multilingual and code-switched
+    speech: language_hints carry the full configured language set and the
+    model transcribes each word in its own language/script.
+    """
+
+    BASE_URL = "https://api.soniox.com"
+
+    def __init__(self, config: ModelConfig, sample_rate: int = 16000):
+        self.config = config
+        self.sample_rate = sample_rate
+        self._api_key: Optional[str] = None
+
+    def _resolve_api_key(self) -> str:
+        return (
+            os.environ.get("SONIOX_API_KEY", "")
+            or str(getattr(self.config, "api_key", "") or "")
+        ).strip()
+
+    def load(self) -> None:
+        key = self._resolve_api_key()
+        if not key:
+            raise RuntimeError(
+                "Soniox backend selected but SONIOX_API_KEY is not set "
+                "(env/.env or config soniox_api_key)"
+            )
+        self._api_key = key
+        logger.info(f"Soniox backend ready (model: {self.config.model_id})")
+
+    def is_loaded(self) -> bool:
+        return bool(self._api_key)
+
+    def cleanup(self) -> None:
+        self._api_key = None
+
+    def _wav_bytes(self, audio: np.ndarray) -> bytes:
+        import io
+        import wave as wave_mod
+
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+        buf = io.BytesIO()
+        with wave_mod.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(self.sample_rate)
+            w.writeframes(pcm.tobytes())
+        return buf.getvalue()
+
+    def transcribe(self, audio: np.ndarray, initial_prompt: Optional[str] = None, beam_size_override: Optional[int] = None, vad_filter_override: Optional[bool] = None) -> TranscriptionResult:
+        if not self.is_loaded():
+            self.load()
+
+        import httpx
+
+        start_time = time.time()
+        audio_duration = len(audio) / self.sample_rate
+        langs = normalize_language_codes(getattr(self.config, "task_languages", ["en"]))
+
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        file_id = None
+        transcription_id = None
+        with httpx.Client(base_url=self.BASE_URL, headers=headers, timeout=30.0) as client:
+            try:
+                resp = client.post(
+                    "/v1/files",
+                    files={"file": ("voiceflow.wav", self._wav_bytes(audio), "audio/wav")},
+                )
+                resp.raise_for_status()
+                file_id = resp.json()["id"]
+
+                resp = client.post(
+                    "/v1/transcriptions",
+                    json={
+                        "model": self.config.model_id,
+                        "file_id": file_id,
+                        "language_hints": langs,
+                        "enable_language_identification": True,
+                    },
+                )
+                resp.raise_for_status()
+                transcription_id = resp.json()["id"]
+
+                data: Dict[str, Any] = {}
+                status = "processing"
+                deadline = time.time() + max(30.0, min(120.0, audio_duration * 3.0 + 30.0))
+                while time.time() < deadline:
+                    resp = client.get(f"/v1/transcriptions/{transcription_id}")
+                    resp.raise_for_status()
+                    data = resp.json()
+                    status = str(data.get("status", ""))
+                    if status in ("completed", "error"):
+                        break
+                    time.sleep(0.4)
+                if status == "error":
+                    raise RuntimeError(f"Soniox transcription failed: {data.get('error_message') or data}")
+                if status != "completed":
+                    raise TimeoutError("Soniox transcription timed out")
+
+                resp = client.get(f"/v1/transcriptions/{transcription_id}/transcript")
+                resp.raise_for_status()
+                tdata = resp.json()
+                tokens = tdata.get("tokens") or []
+                text = "".join(str(t.get("text", "")) for t in tokens).strip()
+                if not text:
+                    text = str(tdata.get("text", "") or "").strip()
+
+                lang_counts: Dict[str, int] = {}
+                for t in tokens:
+                    token_lang = t.get("language")
+                    if token_lang:
+                        lang_counts[token_lang] = lang_counts.get(token_lang, 0) + 1
+                language = max(lang_counts, key=lang_counts.get) if lang_counts else (langs[0] if langs else "en")
+            finally:
+                # Don't leave audio or transcripts on the service.
+                for path in (
+                    f"/v1/transcriptions/{transcription_id}" if transcription_id else None,
+                    f"/v1/files/{file_id}" if file_id else None,
+                ):
+                    if path:
+                        try:
+                            client.delete(path)
+                        except Exception:
+                            pass
+
+        processing_time = time.time() - start_time
+        print(f"[ASR] Soniox: {audio_duration:.1f}s audio in {processing_time:.1f}s (hints: {langs})")
+        return TranscriptionResult(
+            text=text,
+            segments=[],
+            language=language,
+            duration=audio_duration,
+            processing_time=processing_time,
+        )
 
 
 class WhisperXBackend(ASRBackend):
@@ -986,6 +1137,7 @@ class ASREngine:
         condition_on_previous_text: bool = False,
         languages: Optional[List[str]] = None,
         non_english_beam_size: int = 5,
+        mixed_language_prompts: Optional[Dict[str, str]] = None,
     ):
         """Initialize the ASR engine.
 
@@ -1061,6 +1213,7 @@ class ASREngine:
         self.model_config.compute_type = compute_type
         self.model_config.task_languages = list(self.languages)
         self.model_config.non_english_beam_size = max(1, int(non_english_beam_size))
+        self.model_config.mixed_language_prompts = dict(mixed_language_prompts or {})
         self.model_config.vad_filter = vad_filter
         self.model_config.cpu_threads = cpu_threads
         self.model_config.asr_num_workers = asr_num_workers
@@ -1101,6 +1254,8 @@ class ASREngine:
 
         if backend_type == "faster-whisper":
             self._backend = FasterWhisperBackend(self.model_config, self.sample_rate)
+        elif backend_type == "soniox":
+            self._backend = SonioxBackend(self.model_config, self.sample_rate)
         elif backend_type == "whisperx":
             self._backend = WhisperXBackend(
                 self.model_config,
@@ -1280,6 +1435,25 @@ class ModernWhisperASR(ASREngine):
             legacy_language = getattr(cfg, 'language', None)
             languages = [legacy_language] if legacy_language else ["en"]
         non_english_beam_size = getattr(cfg, 'non_english_beam_size', 5)
+        mixed_language_prompts = getattr(cfg, 'mixed_language_prompts', None)
+
+        # Cloud backend selection: env VOICEFLOW_TRANSCRIBER wins over config.
+        transcriber_pref = str(
+            os.environ.get("VOICEFLOW_TRANSCRIBER", "")
+            or getattr(cfg, "asr_backend", "")
+            or "local"
+        ).strip().lower()
+        soniox_api_key = (
+            os.environ.get("SONIOX_API_KEY", "")
+            or str(getattr(cfg, "soniox_api_key", "") or "")
+        ).strip()
+        if transcriber_pref == "soniox":
+            if soniox_api_key:
+                model_name = "soniox"
+                model_tier = None
+                print("[ASR] Using Soniox cloud transcriber (multilingual/code-switch)")
+            else:
+                print("[ASR] Soniox selected but SONIOX_API_KEY is missing; using local models")
         force_cpu = str(os.environ.get("VOICEFLOW_FORCE_CPU", "")).strip().lower() in {"1", "true", "yes"}
         gpu_enabled = bool(getattr(cfg, "enable_gpu_acceleration", True))
 
@@ -1315,6 +1489,7 @@ class ModernWhisperASR(ASREngine):
                 condition_on_previous_text=condition_on_previous_text,
                 languages=languages,
                 non_english_beam_size=non_english_beam_size,
+                mixed_language_prompts=mixed_language_prompts,
             )
             logger.info(f"Using model tier '{model_tier}' -> {self.model_config.name}")
         else:
@@ -1331,7 +1506,10 @@ class ModernWhisperASR(ASREngine):
                 condition_on_previous_text=condition_on_previous_text,
                 languages=languages,
                 non_english_beam_size=non_english_beam_size,
+                mixed_language_prompts=mixed_language_prompts,
             )
+        if getattr(self.model_config, "backend", "") == "soniox" and soniox_api_key:
+            self.model_config.api_key = soniox_api_key
         self.cfg = cfg
 
         # Session tracking for legacy compatibility
