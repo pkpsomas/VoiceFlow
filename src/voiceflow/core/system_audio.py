@@ -28,17 +28,24 @@ class SystemAudioCapture:
     speaker and reopening the loopback recorder.
     """
 
+    # Give up after this many consecutive open/read failures instead of
+    # crash-looping forever (e.g. headset stuck in an unsupported mix format).
+    MAX_CONSECUTIVE_FAILURES = 3
+
     def __init__(
         self,
         sample_rate: int,
         blocksize: int,
         on_chunk: Callable[[np.ndarray], None],
+        on_failed: Optional[Callable[[str], None]] = None,
     ):
         self.sample_rate = int(sample_rate)
         self.blocksize = max(64, int(blocksize))
         self._on_chunk = on_chunk
+        self._on_failed = on_failed
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self.failed = False
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -50,6 +57,7 @@ class SystemAudioCapture:
             logger.error("[SystemAudio] soundcard library not available; cannot capture system audio")
             return False
         self._stop.clear()
+        self.failed = False
         self._thread = threading.Thread(
             target=self._run, name="SystemAudioCapture", daemon=True
         )
@@ -81,6 +89,7 @@ class SystemAudioCapture:
         # Re-resolve the default speaker periodically so capture follows the
         # user when they switch output devices mid-session.
         device_check_samples = self.sample_rate * 3
+        consecutive_failures = 0
 
         while not self._stop.is_set():
             try:
@@ -91,6 +100,7 @@ class SystemAudioCapture:
                 with loopback.recorder(
                     samplerate=self.sample_rate, channels=1, blocksize=self.blocksize
                 ) as rec:
+                    consecutive_failures = 0  # a successful open resets the counter
                     while not self._stop.is_set():
                         data = rec.record(numframes=self.blocksize)
                         if self._stop.is_set():
@@ -107,5 +117,30 @@ class SystemAudioCapture:
             except Exception as e:
                 if self._stop.is_set():
                     return
-                logger.warning(f"[SystemAudio] Capture error, retrying in 1s: {e}")
+                consecutive_failures += 1
+                # soundcard raises a bare AssertionError when the output device's
+                # shared mix format is one it can't wrap (common on headsets in
+                # communications/PCM mode). That won't clear by retrying.
+                reason = (
+                    "output device uses an unsupported audio format "
+                    "(headset in call/communications mode?)"
+                    if isinstance(e, AssertionError)
+                    else str(e) or type(e).__name__
+                )
+                if consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+                    self.failed = True
+                    logger.error(
+                        f"[SystemAudio] Giving up after {consecutive_failures} failures: {reason}"
+                    )
+                    print(f"[SystemAudio] Loopback capture unavailable: {reason}")
+                    if self._on_failed is not None:
+                        try:
+                            self._on_failed(reason)
+                        except Exception:
+                            pass
+                    return
+                logger.warning(
+                    f"[SystemAudio] Capture error ({consecutive_failures}/"
+                    f"{self.MAX_CONSECUTIVE_FAILURES}), retrying in 1s: {reason}"
+                )
                 self._stop.wait(1.0)

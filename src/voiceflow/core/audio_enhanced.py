@@ -433,6 +433,7 @@ class EnhancedAudioRecorder:
         self._system_recording = False
         self._system_target: Optional[BoundedRingBuffer] = None
         self._active_source = "mic"  # source the in-flight recording started with
+        self._system_capture_failed_reason: Optional[str] = None
 
         self._lock = threading.Lock()
         self._recording = False
@@ -551,6 +552,12 @@ class EnhancedAudioRecorder:
             return
         self.cfg.audio_input_source = source
         print(f"[AudioRecorder] Audio source set to: {source}")
+        # Re-selecting a system source is an explicit retry: clear any prior
+        # "device incompatible" latch so the loopback is attempted fresh.
+        if source in ("system", "both"):
+            self._system_capture_failed_reason = None
+            if self._system_capture is not None:
+                self._system_capture.failed = False
         if self._recording:
             return  # applies on next recording
         # Keep the right pre-buffers warm for the new source
@@ -575,13 +582,26 @@ class EnhancedAudioRecorder:
         except Exception as e:
             logger.error(f"[AudioRecorder] Critical error in system audio chunk: {e}")
 
+    def _on_system_capture_failed(self, reason: str):
+        """Called by the capture thread when loopback can't be opened at all."""
+        self._system_capture_failed_reason = reason
+        self._system_recording = False
+        self._system_target = None
+        print(f"[AudioRecorder] System audio unavailable, continuing mic-only: {reason}")
+
     def _ensure_system_capture(self) -> bool:
+        # Don't keep reopening a device that already proved incompatible.
+        if getattr(self, "_system_capture_failed_reason", None):
+            return False
         if self._system_capture is None:
             self._system_capture = SystemAudioCapture(
                 sample_rate=self.cfg.sample_rate,
                 blocksize=self.cfg.blocksize,
                 on_chunk=self._on_system_chunk,
+                on_failed=self._on_system_capture_failed,
             )
+        if self._system_capture.failed:
+            return False
         if not self._system_capture.is_running():
             self._system_pre_buffer.clear()
             return self._system_capture.start()
@@ -720,7 +740,12 @@ class EnhancedAudioRecorder:
                         f"+ system ({len(system_data)} samples, rms={self.last_track_rms['system']:.4f})"
                     )
                 else:
-                    print("[AudioRecorder] System track empty (nothing played on default output?)")
+                    reason = getattr(self, "_system_capture_failed_reason", None)
+                    detail = f" [{reason}]" if reason else " (nothing played on default output?)"
+                    print(
+                        f"[AudioRecorder] System track empty{detail}; "
+                        f"mic {len(audio_data)} samples, rms={self.last_track_rms['mic']:.4f}"
+                    )
                 audio_data = self._mix_tracks(audio_data, system_data)
             elif self._active_source == "system":
                 self.last_track_rms = {"system": self._rms(audio_data)}

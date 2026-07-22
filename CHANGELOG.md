@@ -18,6 +18,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Mixed-language decode seeds** — configurable per-language seed prompts (`mixed_language_prompts`) bias local Whisper decodes to keep embedded English terms in Latin script; the tiny fast-path model is disabled when non-English languages are configured
 
 ### Fixed
+- **System-audio loopback crash-loop** — `soundcard` raises a bare `AssertionError` when the output device exposes a shared mix format it can't wrap (e.g. a headset in call/communications mode), which previously retried once per second forever and captured nothing. Capture now gives up after 3 attempts, degrades to mic-only, and surfaces a clear reason; re-selecting a system source retries fresh. Mic RMS is logged even when the system track is empty.
+
+### Fixed
 - **Missing dependency** — `psutil` is imported by `process_monitor` but was absent from `pyproject.toml`; fresh installs crashed at launch
 
 ---
