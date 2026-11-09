@@ -22,6 +22,9 @@ class Config:
     blocksize: int = 512  # frames per callback, ~64 ms at 16k
     audio_input_source: str = "mic"  # "mic" | "system" (WASAPI loopback) | "both" (mixed)
     input_device: str | None = None  # mic device name (substring match); None = system default
+    # Two-channel labels: by default mic="You", incoming system audio="Them".
+    # Set True to swap them if your setup routes them the other way.
+    swap_channel_labels: bool = False
 
     # Performance optimizations
     enable_batching: bool = True  # Enable VAD-based batching for 12.5x speedup

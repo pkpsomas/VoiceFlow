@@ -2783,8 +2783,12 @@ class EnhancedApp:
             # Two-channel combination: decode the incoming ("Them") track and
             # merge with the mic ("You") text into one labeled transcript.
             if cochannel_audio is not None and len(cochannel_audio) > 0:
-                them_text = self._transcribe_cochannel(cochannel_audio)
-                you_text = text.strip()
+                mic_text = text.strip()
+                incoming_text = self._transcribe_cochannel(cochannel_audio)
+                # Default: mic -> "You", incoming system audio -> "Them".
+                you_text, them_text = mic_text, incoming_text
+                if bool(getattr(self.cfg, "swap_channel_labels", False)):
+                    you_text, them_text = incoming_text, mic_text
                 if them_text or you_text:
                     labeled = []
                     if you_text:
