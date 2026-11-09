@@ -346,9 +346,9 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
     # Cloud backends
     "soniox": ModelConfig(
         name="Soniox (cloud)",
-        model_id="stt-async-v5",
+        model_id="stt-async-v6",
         backend="soniox",
-        description="Soniox async STT API: native multilingual and code-switching",
+        description="Soniox async STT API v6: native multilingual and code-switching",
         size_mb=0,
         languages=["multilingual"],
     ),
