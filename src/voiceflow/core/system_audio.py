@@ -10,26 +10,39 @@ logger = logging.getLogger(__name__)
 
 
 def system_audio_supported() -> bool:
-    """Check whether WASAPI loopback capture is available (soundcard installed)."""
+    """Check whether WASAPI loopback capture is available (PyAudioWPatch)."""
     try:
-        import soundcard  # noqa: F401
+        import pyaudiowpatch  # noqa: F401
 
         return True
     except Exception:
         return False
 
 
+def _resample_to_target(mono: np.ndarray, native_rate: int, target_rate: int) -> np.ndarray:
+    """Linear-resample a mono float32 signal; adequate for speech ASR."""
+    if native_rate == target_rate or mono.size == 0:
+        return mono
+    n_out = int(round(len(mono) * float(target_rate) / float(native_rate)))
+    if n_out <= 0:
+        return np.zeros(0, dtype=np.float32)
+    x_old = np.linspace(0.0, 1.0, num=len(mono), endpoint=False)
+    x_new = np.linspace(0.0, 1.0, num=n_out, endpoint=False)
+    return np.interp(x_new, x_old, mono).astype(np.float32)
+
+
 class SystemAudioCapture:
     """Continuous WASAPI loopback capture of system output audio.
 
-    Records whatever is playing on the default output device (speakers/headset)
-    and delivers mono float32 chunks at the requested sample rate via `on_chunk`.
-    Runs in a daemon thread; survives device errors by re-resolving the default
-    speaker and reopening the loopback recorder.
+    Uses PyAudioWPatch (a PortAudio fork with WASAPI loopback). PortAudio
+    negotiates the endpoint format natively, so this avoids the Python-side
+    format assertion that the `soundcard` package hit on headsets in
+    communications/call mode. Delivers mono float32 chunks resampled to the
+    requested sample rate via `on_chunk`.
     """
 
-    # Give up after this many consecutive open/read failures instead of
-    # crash-looping forever (e.g. headset stuck in an unsupported mix format).
+    # Give up after this many consecutive open failures instead of
+    # crash-looping forever (e.g. an endpoint that never accepts loopback).
     MAX_CONSECUTIVE_FAILURES = 3
 
     def __init__(
@@ -54,7 +67,7 @@ class SystemAudioCapture:
         if self.is_running():
             return True
         if not system_audio_supported():
-            logger.error("[SystemAudio] soundcard library not available; cannot capture system audio")
+            logger.error("[SystemAudio] PyAudioWPatch not available; cannot capture system audio")
             return False
         self._stop.clear()
         self.failed = False
@@ -70,63 +83,92 @@ class SystemAudioCapture:
         thread = self._thread
         self._thread = None
         if thread is not None and thread.is_alive():
-            # record() blocks while the system is silent; daemon thread exits on
-            # its own once audio flows or the process ends, so don't wait long.
             thread.join(timeout=2.0)
         print("[SystemAudio] Loopback capture stopped")
 
+    def _resolve_loopback(self, p):
+        """Return the loopback device info dict for the default output, or None."""
+        import pyaudiowpatch as pa
+
+        wasapi = p.get_host_api_info_by_type(pa.paWASAPI)
+        default_out = p.get_device_info_by_index(wasapi["defaultOutputDevice"])
+        if default_out.get("isLoopbackDevice"):
+            return default_out
+        # Loopback devices are duplicated at the end of the list, matched by name.
+        for cand in p.get_loopback_device_info_generator():
+            if default_out["name"] in cand["name"]:
+                return cand
+        return None
+
     def _run(self):
-        import warnings
+        import pyaudiowpatch as pa
 
-        import soundcard as sc
-
-        # Silence-gap discontinuities are routine for loopback capture and
-        # would otherwise flood stderr with one warning per chunk.
-        warnings.filterwarnings(
-            "ignore", category=sc.SoundcardRuntimeWarning, message=".*discontinuity.*"
-        )
-
-        # Re-resolve the default speaker periodically so capture follows the
-        # user when they switch output devices mid-session.
-        device_check_samples = self.sample_rate * 3
         consecutive_failures = 0
 
         while not self._stop.is_set():
+            p = None
+            stream = None
             try:
-                speaker = sc.default_speaker()
-                loopback = sc.get_microphone(speaker.id, include_loopback=True)
-                print(f"[SystemAudio] Capturing loopback of: {speaker.name}")
-                samples_since_check = 0
-                with loopback.recorder(
-                    samplerate=self.sample_rate, channels=1, blocksize=self.blocksize
-                ) as rec:
-                    consecutive_failures = 0  # a successful open resets the counter
-                    while not self._stop.is_set():
-                        data = rec.record(numframes=self.blocksize)
-                        if self._stop.is_set():
-                            return
-                        chunk = np.asarray(data, dtype=np.float32).reshape(-1)
-                        if chunk.size:
-                            self._on_chunk(chunk)
-                        samples_since_check += chunk.size
-                        if samples_since_check >= device_check_samples:
-                            samples_since_check = 0
-                            if sc.default_speaker().id != speaker.id:
-                                print("[SystemAudio] Default output changed; reopening loopback")
-                                break
+                p = pa.PyAudio()
+                device = self._resolve_loopback(p)
+                if device is None:
+                    raise RuntimeError("no WASAPI loopback device for the default output")
+
+                native_rate = int(device["defaultSampleRate"])
+                channels = max(1, int(device["maxInputChannels"]))
+                device_index = int(device["index"])
+                default_out_index = int(
+                    p.get_host_api_info_by_type(pa.paWASAPI)["defaultOutputDevice"]
+                )
+                print(f"[SystemAudio] Capturing loopback of: {device['name']}")
+
+                def _callback(in_data, frame_count, time_info, status):  # noqa: ARG001
+                    if self._stop.is_set():
+                        return (None, pa.paComplete)
+                    try:
+                        samples = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
+                        if channels > 1:
+                            samples = samples.reshape(-1, channels).mean(axis=1)
+                        mono = _resample_to_target(samples, native_rate, self.sample_rate)
+                        if mono.size:
+                            self._on_chunk(mono)
+                    except Exception as cb_err:
+                        logger.debug(f"[SystemAudio] callback error: {cb_err}")
+                    return (None, pa.paContinue)
+
+                stream = p.open(
+                    format=pa.paInt16,
+                    channels=channels,
+                    rate=native_rate,
+                    frames_per_buffer=self.blocksize,
+                    input=True,
+                    input_device_index=device_index,
+                    stream_callback=_callback,
+                )
+                stream.start_stream()
+                consecutive_failures = 0  # a successful open resets the counter
+
+                # Keep the stream alive; reopen if the default output device
+                # changes (user switched headset/speakers) or the stream drops.
+                while not self._stop.is_set():
+                    if not stream.is_active():
+                        print("[SystemAudio] Stream inactive; reopening loopback")
+                        break
+                    try:
+                        cur = int(
+                            p.get_host_api_info_by_type(pa.paWASAPI)["defaultOutputDevice"]
+                        )
+                        if cur != default_out_index:
+                            print("[SystemAudio] Default output changed; reopening loopback")
+                            break
+                    except Exception:
+                        pass
+                    self._stop.wait(0.5)
             except Exception as e:
                 if self._stop.is_set():
-                    return
+                    break
                 consecutive_failures += 1
-                # soundcard raises a bare AssertionError when the output device's
-                # shared mix format is one it can't wrap (common on headsets in
-                # communications/PCM mode). That won't clear by retrying.
-                reason = (
-                    "output device uses an unsupported audio format "
-                    "(headset in call/communications mode?)"
-                    if isinstance(e, AssertionError)
-                    else str(e) or type(e).__name__
-                )
+                reason = str(e) or type(e).__name__
                 if consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
                     self.failed = True
                     logger.error(
@@ -138,9 +180,26 @@ class SystemAudioCapture:
                             self._on_failed(reason)
                         except Exception:
                             pass
+                    self._safe_close(stream, p)
                     return
                 logger.warning(
                     f"[SystemAudio] Capture error ({consecutive_failures}/"
                     f"{self.MAX_CONSECUTIVE_FAILURES}), retrying in 1s: {reason}"
                 )
                 self._stop.wait(1.0)
+            finally:
+                self._safe_close(stream, p)
+
+    @staticmethod
+    def _safe_close(stream, p):
+        try:
+            if stream is not None:
+                stream.stop_stream()
+                stream.close()
+        except Exception:
+            pass
+        try:
+            if p is not None:
+                p.terminate()
+        except Exception:
+            pass

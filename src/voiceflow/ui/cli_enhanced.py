@@ -2084,6 +2084,17 @@ class EnhancedApp:
             audio = self.rec.stop()
             audio_duration = len(audio) / self.cfg.sample_rate if len(audio) > 0 else 0
 
+            # Two-channel ("both") mode: the incoming/system ("Them") track is
+            # kept separate from the mic ("You") track for labeled transcription.
+            active_source = getattr(self.rec, "_active_source", "mic")
+            system_track = getattr(self.rec, "last_system_track", None)
+            has_them = (
+                active_source == "both"
+                and system_track is not None
+                and len(system_track) > 0
+                and float(np.max(np.abs(system_track))) > 1e-3
+            )
+
             # Audio feedback: lower tone signals recording stopped, processing starting
             if getattr(self.cfg, "audio_feedback_beeps", True):
                 _play_beep(440, 60)
@@ -2092,6 +2103,14 @@ class EnhancedApp:
 
             self._log.info("recording_stopped duration=%.2f samples=%d",
                           audio_duration, len(audio))
+
+            if audio.size == 0 and has_them:
+                # You were silent but the other party was captured: route the
+                # incoming track through the normal path (no You/Them label).
+                audio = system_track
+                audio_duration = len(audio) / self.cfg.sample_rate
+                has_them = False
+                system_track = None
 
             if audio.size == 0:
                 print("[MIC] No audio captured")
@@ -2117,8 +2136,9 @@ class EnhancedApp:
                 peak_threshold = getattr(self.cfg, 'min_peak_amplitude', 1e-4)
 
                 # Check if audio is essentially silent (background noise only)
-                # Both conditions must be true - energy AND peak must be below thresholds
-                if audio_energy < silence_threshold and max_amplitude < peak_threshold:
+                # Both conditions must be true - energy AND peak must be below thresholds.
+                # In two-channel mode, proceed anyway if the other party was captured.
+                if audio_energy < silence_threshold and max_amplitude < peak_threshold and not has_them:
                     print(f"[MIC] Silent audio detected (energy: {audio_energy:.6f}, max: {max_amplitude:.6f}) - skipping transcription")
                     # Return to idle state
                     mark_idle()
@@ -2151,9 +2171,12 @@ class EnhancedApp:
                 if VISUAL_INDICATORS_AVAILABLE:
                     show_processing()
 
-            # Enhanced transcription with proper thread management
+            # Enhanced transcription with proper thread management. In two-channel
+            # mode the incoming ("Them") track rides along for labeled output.
+            cochannel = system_track if has_them else None
+
             def transcription_callback(audio_data: np.ndarray) -> str:
-                return self._perform_transcription(audio_data)
+                return self._perform_transcription(audio_data, cochannel_audio=cochannel)
 
             # Submit to thread pool instead of creating ad-hoc threads
             job_id = self.transcription_manager.submit_transcription(
@@ -2171,8 +2194,41 @@ class EnhancedApp:
                 if VISUAL_INDICATORS_AVAILABLE:
                     show_error(f"Stop error: {e}")
 
-    def _perform_transcription(self, audio_data: np.ndarray) -> str:
-        """Perform actual transcription with enhanced error handling and timeout protection"""
+    def _transcribe_cochannel(self, audio_data: np.ndarray) -> str:
+        """Transcribe the incoming ("Them") system-audio track for two-channel mode.
+
+        Deliberately lightweight: it decodes with the primary engine and applies
+        basic formatting only. The heavy dictation pipeline (course correction,
+        continual-learning observation, injection) is for the user's own voice,
+        not the other party's.
+        """
+        try:
+            if audio_data is None or len(audio_data) == 0:
+                return ""
+            engine, _path = self._pick_asr_engine(
+                len(audio_data) / self.cfg.sample_rate, force_primary=True
+            )
+            result = engine.transcribe(audio_data)
+            text = result if isinstance(result, str) else getattr(result, "text", "")
+            text = (text or "").strip()
+            if not text:
+                return ""
+            try:
+                text = format_transcript_text(text)
+            except Exception:
+                pass
+            return text.strip()
+        except Exception as e:
+            self._log.warning("cochannel_transcription_failed error=%s", e)
+            return ""
+
+    def _perform_transcription(self, audio_data: np.ndarray, cochannel_audio: Optional[np.ndarray] = None) -> str:
+        """Perform actual transcription with enhanced error handling and timeout protection.
+
+        When `cochannel_audio` is provided (two-channel "both" mode), the mic
+        track is decoded as "You" through the full pipeline and the incoming
+        system track as "Them", then combined into one labeled transcript.
+        """
         # Ensure logger is available (fix for scoping issue)
         logger = logging.getLogger(__name__)
         stage_ms: Dict[str, float] = {}
@@ -2723,6 +2779,20 @@ class EnhancedApp:
                     stage_ms.get("second_pass_heavy", 0.0),
                 )
             stage_ms["postprocess"] = (time.perf_counter() - postprocess_start) * 1000.0
+
+            # Two-channel combination: decode the incoming ("Them") track and
+            # merge with the mic ("You") text into one labeled transcript.
+            if cochannel_audio is not None and len(cochannel_audio) > 0:
+                them_text = self._transcribe_cochannel(cochannel_audio)
+                you_text = text.strip()
+                if them_text or you_text:
+                    labeled = []
+                    if you_text:
+                        labeled.append(f"You: {you_text}")
+                    if them_text:
+                        labeled.append(f"Them: {them_text}")
+                    text = "\n".join(labeled)
+                    print(f"[TRANSCRIPTION] two-channel -> You:{len(you_text)}c Them:{len(them_text)}c")
 
             # Performance tracking
             transcription_time = time.perf_counter() - start_time

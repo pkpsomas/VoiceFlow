@@ -440,6 +440,9 @@ class EnhancedAudioRecorder:
         self._start_time = 0.0
         # Per-track RMS of the last completed recording, keyed by source name.
         self.last_track_rms: dict = {}
+        # System ("Them") track from the last "both"-mode recording, kept
+        # separate from the returned mic track for labeled transcription.
+        self.last_system_track: np.ndarray = np.zeros(0, dtype=np.float32)
         
         # Performance monitoring
         self._callback_count = 0
@@ -650,7 +653,7 @@ class EnhancedAudioRecorder:
 
         source = self.get_audio_source()
         if source in ("system", "both") and not system_audio_supported():
-            print("[AudioRecorder] System audio capture unavailable (soundcard missing); using mic only")
+            print("[AudioRecorder] System audio capture unavailable (PyAudioWPatch missing); using mic only")
             source = "mic"
         mic_on = source in ("mic", "both")
         system_on = source in ("system", "both")
@@ -729,14 +732,19 @@ class EnhancedAudioRecorder:
                 self._stream.close()
                 self._stream = None
 
-            # Get the recorded audio data
+            # Get the recorded audio data. In "both" mode the mic and system
+            # tracks are kept SEPARATE (not mixed): the caller transcribes each
+            # and labels them You/Them. stop() returns the mic track; the system
+            # track is exposed via self.last_system_track.
             audio_data = self._ring_buffer.get_data()
+            self.last_system_track = np.zeros(0, dtype=np.float32)
             if self._active_source == "both":
                 system_data = self._system_ring_buffer.get_data()
                 self.last_track_rms = {"mic": self._rms(audio_data), "system": self._rms(system_data)}
+                self.last_system_track = system_data
                 if len(system_data) > 0:
                     print(
-                        f"[AudioRecorder] Mixing mic ({len(audio_data)} samples, rms={self.last_track_rms['mic']:.4f}) "
+                        f"[AudioRecorder] Two-channel: mic ({len(audio_data)} samples, rms={self.last_track_rms['mic']:.4f}) "
                         f"+ system ({len(system_data)} samples, rms={self.last_track_rms['system']:.4f})"
                     )
                 else:
@@ -746,7 +754,6 @@ class EnhancedAudioRecorder:
                         f"[AudioRecorder] System track empty{detail}; "
                         f"mic {len(audio_data)} samples, rms={self.last_track_rms['mic']:.4f}"
                     )
-                audio_data = self._mix_tracks(audio_data, system_data)
             elif self._active_source == "system":
                 self.last_track_rms = {"system": self._rms(audio_data)}
                 print(f"[AudioRecorder] System track: {len(audio_data)} samples, rms={self.last_track_rms['system']:.4f}")

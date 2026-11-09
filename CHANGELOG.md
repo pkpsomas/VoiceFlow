@@ -17,8 +17,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Dock record toggle** — a Record/Stop button in the always-on dock starts and stops transcription hands-free, without holding the PTT keys
 - **Mixed-language decode seeds** — configurable per-language seed prompts (`mixed_language_prompts`) bias local Whisper decodes to keep embedded English terms in Latin script; the tiny fast-path model is disabled when non-English languages are configured
 
+### Changed
+- **Dual-channel loopback via PyAudioWPatch** — replaced the `soundcard` dependency with **PyAudioWPatch** (PortAudio fork with WASAPI loopback). PortAudio negotiates the endpoint format natively, so loopback now opens on headsets in call/communications mode where `soundcard` threw a bare `AssertionError`. Captured loopback is downmixed to mono and resampled to 16 kHz.
+- **"Both" mode is now two labeled channels** — instead of mixing mic + system into one track, the microphone ("You") and incoming system audio ("Them") are captured and transcribed **separately**, then injected as a labeled `You:` / `Them:` transcript. The mic track still flows through the full dictation pipeline; the incoming track is decoded with a lightweight pass. A window where only the other party speaks is still captured.
+
 ### Fixed
-- **System-audio loopback crash-loop** — `soundcard` raises a bare `AssertionError` when the output device exposes a shared mix format it can't wrap (e.g. a headset in call/communications mode), which previously retried once per second forever and captured nothing. Capture now gives up after 3 attempts, degrades to mic-only, and surfaces a clear reason; re-selecting a system source retries fresh. Mic RMS is logged even when the system track is empty.
+- **System-audio loopback crash-loop** — the loopback capture thread previously retried a failing open once per second forever and captured nothing. Capture now gives up after 3 attempts, degrades to mic-only, and surfaces a clear reason; re-selecting a system source retries fresh. Mic RMS is logged even when the system track is empty.
 
 ### Fixed
 - **Missing dependency** — `psutil` is imported by `process_monitor` but was absent from `pyproject.toml`; fresh installs crashed at launch
